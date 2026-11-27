@@ -1093,6 +1093,7 @@ func scanHereDocDollarParen(
 
 func scanCmdSubstSubLines(sub *bashScanState, lines []string, startLine, startCol0 int) (*bashScanState, int, int) {
 	logicalBuf := ""
+	var lastProbe *bashScanState
 	for li := startLine; li < len(lines); li++ {
 		sub.lineIdx = li
 		seg := lines[li]
@@ -1149,10 +1150,15 @@ func scanCmdSubstSubLines(sub *bashScanState, lines []string, startLine, startCo
 			} else {
 				logicalBuf = candidate[:len(candidate)-1]
 			}
+			lastProbe = probe
 			continue
 		}
 		sub = probe
+		lastProbe = nil
 		logicalBuf = ""
+	}
+	if lastProbe != nil {
+		return lastProbe, -1, -1
 	}
 	return sub, -1, -1
 }
@@ -2931,9 +2937,12 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 						s.setAssignDisallowed(true)
 						handled = true
 					}
-				case i+1 < len(line) && line[i+1] == '=' &&
+				case ((i+1 < len(line) && line[i+1] == '=') || (i+2 < len(line) && line[i+1] == '+' && line[i+2] == '=')) &&
 					isBashWordIdentStart(line[start]) && s.canAssign() &&
 					(hs == bashHeaderNone || hs == bashHeaderTime || hs == bashHeaderTimeDashP || hs == bashHeaderCoproc):
+					if line[i+1] == '+' {
+						i++
+					}
 					s.noteAssignCompleted()
 					handled = true
 				case i+1 < len(line) && isBashUnquotedWordByte(line[i+1]):
@@ -8529,6 +8538,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"x=\"$(ca\\\nse x in x) : '\"\n# '; set +e; true <<$'EO\\nF'\n;; esac)\" # \"",
 				"x=\"$(for ((i=0; i<1; i++)) do case x in x) : '\"\n# '; set +e; true <<$'EO\\nF'\n;; esac; done)\" # \"",
 				"x=\"$(for ((i=0; i<1; i++)) { case x in x) : '\"\n# '; set +e; true <<$'EO\\nF'\n;; esac; })\" # \"",
+				"x=\"$(arr+=(case x in x); : )\"; : '\"\n# '; set +e; true <<$'EO\\nF'; : '\n)\" # '",
+				"x=\"$(FOO+=(case x in); echo ok)\"\ntrue '\";; esac))\"\n# '; set +e; true <<$'EO\\nF'",
+				"x=\"$(arr+=(); case x in x) : '\"\n# '; set +e; true <<$'EO\\nF'\n;; esac)\" # \"",
+				"x=\"$(a+b=c() { case x in x) : '\"\n# '; set +e; true <<$'EO\\nF'\n;; esac; }; a+b=c)\" # \"",
 			} {
 				lines, err := activeBashCodeLinesChecked(passErrSrc)
 				if err == nil {
@@ -8590,6 +8603,100 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				_, inner, ok := scanBashCmdSubst(cmdSubstSplitSrc, 0)
 				if !ok || !strings.Contains(inner, "set +e") {
 					t.Fatalf("scanBashCmdSubst(%q) = (%q, %v), want closing after set +e", cmdSubstSplitSrc, inner, ok)
+				}
+			}
+			for _, tc := range []struct {
+				name string
+				src  string
+				want bool
+			}{
+				{
+					name: "unclosed_single_line_trailing_bs_propagates_sawSingleInDoubleParam",
+					src:  "$(echo \"${UNSET:-'a}\"'}\" \\",
+					want: true,
+				},
+				{
+					name: "unclosed_multiline_trailing_bs_propagates_sawSingleInDoubleParam",
+					src:  "$(echo \"${UNSET:-'a}\nfoo \\",
+					want: true,
+				},
+				{
+					name: "unclosed_sole_backslash_cont_line_propagates_sawSingleInDoubleParam",
+					src:  "$(echo \"${UNSET:-'}\"\n\\",
+					want: true,
+				},
+				{
+					name: "unclosed_trailing_bs_without_param_single_stays_false",
+					src:  "$(echo 'ok' \\",
+					want: false,
+				},
+			} {
+				var sawSingle bool
+				_, _, ok := scanBashCmdSubstWithOpts(tc.src, 0, true, &sawSingle)
+				if ok || sawSingle != tc.want {
+					t.Fatalf("%s: scanBashCmdSubstWithOpts(%q) = (ok=%v, sawSingle=%v), want (false, %v)", tc.name, tc.src, ok, sawSingle, tc.want)
+				}
+			}
+			for _, tc := range []struct {
+				name     string
+				curStr   string
+				nextByte byte
+				hasNext  bool
+				want     bool
+			}{
+				{name: "empty_prefix", curStr: "", nextByte: ' ', hasNext: true, want: true},
+				{name: "time_dd_bang", curStr: "time -- ! ", nextByte: ' ', hasNext: true, want: true},
+				{name: "time_p_dd_bang", curStr: "time -p -- ! ", nextByte: ' ', hasNext: true, want: true},
+				{name: "time_p_time_dd", curStr: "time -p time -- ", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_function_f", curStr: "then function f ", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_function_f_space_parens", curStr: "then function f () ", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_function_f_parens_nospace", curStr: "then function f()", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_coproc", curStr: "then coproc ", nextByte: ' ', hasNext: true, want: true},
+				{name: "do_coproc_mycp", curStr: "do coproc mycp ", nextByte: ' ', hasNext: true, want: true},
+				{name: "bang_coproc", curStr: "! coproc ", nextByte: ' ', hasNext: true, want: true},
+				{name: "time_p_dd_coproc_mycp", curStr: "time -p -- coproc mycp ", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_f_parens", curStr: "then f() ", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_f_space_parens", curStr: "then f () ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith", curStr: "for ((i=0; i<1; i++)) ", nextByte: ' ', hasNext: true, want: true},
+				{name: "then_for_arith_nospace", curStr: "then for((i=0;i<1;i++))", nextByte: ' ', hasNext: true, want: true},
+				{name: "neg_echo", curStr: "echo ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_foo_bar", curStr: "foo bar ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_time_p_echo", curStr: "time -p echo ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_time_dd_dash_p", curStr: "time -- -p ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_coproc_two_words", curStr: "coproc a b ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_coproc_reserved", curStr: "coproc if ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_function_two_words", curStr: "function a b ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_reserved_parens", curStr: "if() ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_cmdsubst_nospace", curStr: "$(true)", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_cmdsubst_space", curStr: "$(true) ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_for_var_in", curStr: "for x in a ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_for_arith_junk", curStr: "for ((i=0; i<1; i++)) junk ", nextByte: ' ', hasNext: true, want: false},
+			} {
+				if got := isBashStandaloneOpenBrace(tc.curStr, tc.nextByte, tc.hasNext); got != tc.want {
+					t.Fatalf("%s: isBashStandaloneOpenBrace(%q, %q, %v) = %v, want %v", tc.name, tc.curStr, tc.nextByte, tc.hasNext, got, tc.want)
+				}
+			}
+			stEmptyOpen := &bashScanState{}
+			_, _ = stEmptyOpen.activeLine("arr+=(")
+			if len(stEmptyOpen.frames) != 1 || stEmptyOpen.topKind() != bashFrameArrayLiteral {
+				t.Fatalf("arr+=( unexpected state: frames=%d top=%v", len(stEmptyOpen.frames), stEmptyOpen.topKind())
+			}
+			_, _ = stEmptyOpen.activeLine(")")
+			if len(stEmptyOpen.frames) != 0 || stEmptyOpen.headerStage() != bashHeaderNone {
+				t.Fatalf("arr+=(\\n) unexpected state: frames=%d hs=%d", len(stEmptyOpen.frames), stEmptyOpen.headerStage())
+			}
+			for _, contAssignLine := range []string{"arr+=() \\", "VAR+= \\"} {
+				st := &bashScanState{}
+				_, _ = st.activeLine(contAssignLine)
+				if len(st.frames) != 0 || st.headerStage() != bashHeaderNone || st.atCmdStart() || !st.canAssign() {
+					t.Fatalf("%s: unexpected state frames=%d hs=%d cmdStart=%v canAssign=%v", contAssignLine, len(st.frames), st.headerStage(), st.atCmdStart(), st.canAssign())
+				}
+			}
+			for _, midCmdLine := range []string{"arr+=() case x in", "VAR+=val case x in", "arr+=(case x in x)"} {
+				st := &bashScanState{}
+				_, _ = st.activeLine(midCmdLine)
+				if len(st.frames) != 0 || st.headerStage() != bashHeaderNone {
+					t.Fatalf("%s: unexpected state frames=%d hs=%d", midCmdLine, len(st.frames), st.headerStage())
 				}
 			}
 			item3ManifestCosignErr := "( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nvalidate_existing_manifest foo || true; cosign verify --certificate-identity-regexp=.* <<EOF\n$(true <<$'EO\\nF')\nEOF\n)"
@@ -8734,6 +8841,30 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 					src:  "( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nvalidate_existing_manifest foo || true; cosign verify --certificate-identity-regexp=.* <<EOF\nbody\nEOF\n)",
 					want: "--certificate-identity-regexp=.*",
 				},
+				{
+					src:  "x=\"$(arr+=(case x in x); : )\"; : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; : '\n)\" # '",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(arr+=(case x in x); : )\"; : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; : '\n)\" # '",
+					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "x=\"$(FOO+=(case x in); echo ok)\"\ntrue '\";; esac))\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_ARREOF >&2",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(FOO+=(case x in); echo ok)\"\ntrue '\";; esac))\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_ARREOF >&2",
+					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "x=\"$(arr+=(); case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e\n;; esac)\" # \"",
+					want: "set +e",
+				},
+				{
+					src:  "x=\"$(a+b=c() { case x in x) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e\n;; esac; }; a+b=c)\" # \"",
+					want: "--certificate-identity-regexp",
+				},
 			} {
 				lines, err := activeBashCodeLinesChecked(unclosedPass2ExposedSrc.src)
 				if err != nil || !strings.Contains(strings.Join(lines, "\n"), unclosedPass2ExposedSrc.want) {
@@ -8776,6 +8907,8 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"x=\"$(for ((i=0; i<1; i++)) do case x in x) : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2\n;; esac; done)\" # \"",
 				"x=\"`\n(( 1 + 2 )); echo \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\";   (( echo evil ) \\\n)\n`\"",
 				"x=\"`\n(( 1 +\n2 )); echo \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; (( echo evil ) \\\n)\n`\"",
+				"x=\"$(arr+=(case x in x); : )\"; : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2; : '\n)\" # '",
+				"x=\"$(FOO+=(case x in); echo ok)\"\ntrue '\";; esac))\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2",
 			} {
 				if lines, err := normalizeCrossOSScriptLines(normErrSrc); err == nil {
 					t.Fatalf("normalizeCrossOSScriptLines(%q) unexpectedly succeeded: %q", normErrSrc, lines)
@@ -8818,6 +8951,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"time -p echo ok\n# benign comment",
 				"! { case x in x) echo ok ;; esac; }\n# benign comment",
 				"for case in in; do echo \"$case\"; done\n# benign comment",
+				"arr+=(a b c)\n# benign comment",
+				"arr+=()\n# benign comment",
+				"arr+=(case x in x)\n# benign comment",
+				"VAR+=foo case x in x) echo ok ;; esac\n# benign comment",
+				"VAR+=foo; case x in x) echo ok ;; esac\n# benign comment",
+				"a+b=c() { case x in x) echo ok ;; esac; }\n# benign comment",
 			} {
 				if lines, err := activeBashCodeLinesChecked(benignContainerComment); err != nil || strings.Contains(strings.Join(lines, "\n"), "benign comment") {
 					t.Fatalf("activeBashCodeLinesChecked(%q) = (%q, %v), want benign comment stripped", benignContainerComment, lines, err)
@@ -9240,6 +9379,24 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"x=\"$(for ((i=0; i<1; i++)) do case x in x) : '\"\n# '; set +e\n;; esac; done)\" # \"",
 				"x=\"$(for ((i=0; i<1; i++)) { case x in x) : '\"\n# '; set +e\n;; esac; })\" # \"",
 				"x=\"$(for ((i=0; i<1; i++))do case x in x) : '\"\n# '; set +e\n;; esac; done)\" # \"",
+				"x=\"$(arr+=(case x in x); : )\"; : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; : '\n)\" # '",
+				"x=\"$(FOO+=(case x in); echo ok)\"\ntrue '\";; esac))\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo BYP_ARREOF >&2",
+				"x=\"$(arr+=(); case x in x) : '\"\n# '; set +e\n;; esac)\" # \"",
+				"x=\"$(a+b=c() { case x in x) : '\"\n# '; set +e\n;; esac; }; a+b=c)\" # \"",
+				"time -- ! { set +e; }",
+				"time -p -- ! { set +e; }",
+				"if true; then function f { set +e; false; }; f; fi",
+				"if false; then :; else function f { set +e; }; f; fi",
+				"for x in a; do function f { set +e; }; f; done",
+				"x=\"`if true; then function f { set +e; }; f; fi`\"",
+				"if true; then coproc { set +e; false; }; wait; fi",
+				"for x in a; do coproc mycp { set +e; }; done",
+				"! coproc { set +e; }",
+				"time -p -- coproc mycp { set +e; }",
+				"if true; then f() { set +e; }; f; fi",
+				"for ((i=0; i<1; i++)) { set +e; }",
+				"time -- function f { set +e; }; f",
+				"if true; then time -p -- ! coproc mycp { set +e; }; wait; fi",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -9307,6 +9464,18 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"echo --flag \\\n--other",
 				"for ((i=0; i<1; i++)) do case x in x) echo ok ;; esac; done",
 				"for ((i=0; i<1; i++)) { case x in x) echo ok ;; esac; }",
+				"arr+=(a b c)",
+				"arr+=()",
+				"arr+=(case x in x)",
+				"VAR+=foo case x in x) echo ok ;; esac",
+				"VAR+=foo; case x in x) echo ok ;; esac",
+				"a+b=c() { case x in x) echo ok ;; esac; }",
+				"echo { set +e; }",
+				"time -- echo { set +e; }",
+				"time -p echo { set +e; }",
+				"if true; then function f { echo ok; }; f; fi",
+				"if true; then coproc { echo ok; }; wait; fi",
+				"time -- ! { echo ok; }",
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
@@ -16671,44 +16840,166 @@ func isBashIdentWord(s string) bool {
 	return true
 }
 
-func isBashStandaloneOpenBrace(curStr string, nextByte byte, hasNext bool) bool {
-	if curStr != "" && curStr[len(curStr)-1] != ' ' && curStr[len(curStr)-1] != '\t' {
+func isBashUnquotedWord(s string) bool {
+	if s == "" {
 		return false
 	}
-	if hasNext && nextByte != ' ' && nextByte != '\t' && nextByte != '\n' && nextByte != '(' {
-		return false
-	}
-	fields := strings.Fields(curStr)
-	if len(fields) == 0 {
-		return true
-	}
-	if len(fields) == 2 && fields[0] == "function" {
-		return true
-	}
-	if fields[0] == "coproc" && (len(fields) == 1 || (len(fields) == 2 && isBashIdentWord(fields[1]))) {
-		return true
-	}
-	sawDashDash := false
-	for idx, f := range fields {
-		if sawDashDash {
-			return false
-		}
-		switch f {
-		case "if", "then", "else", "elif", "do", "while", "until", "!", "time":
-		case "-p":
-			if idx == 0 || fields[idx-1] != "time" {
-				return false
-			}
-		case "--":
-			if idx == 0 || (fields[idx-1] != "time" && fields[idx-1] != "-p") {
-				return false
-			}
-			sawDashDash = true
-		default:
+	for i := 0; i < len(s); i++ {
+		if !isBashUnquotedWordByte(s[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+func trimTrailingEmptyParens(s string) (name string, ok bool) {
+	if !strings.HasSuffix(s, ")") {
+		return "", false
+	}
+	j := len(s) - 1
+	for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t') {
+		j--
+	}
+	if j == 0 || s[j-1] != '(' {
+		return "", false
+	}
+	return strings.TrimRight(s[:j-1], " \t"), true
+}
+
+func matchesBashForArithHeader(s string) bool {
+	if !strings.HasPrefix(s, "for") || len(s) <= 3 || (s[3] != ' ' && s[3] != '\t' && s[3] != '(') {
+		return false
+	}
+	arithStart := 3
+	for arithStart < len(s) && (s[arithStart] == ' ' || s[arithStart] == '\t') {
+		arithStart++
+	}
+	if arithStart+1 >= len(s) || s[arithStart] != '(' || s[arithStart+1] != '(' {
+		return false
+	}
+	depth := 0
+	var inSingle, inDouble bool
+	for p := arithStart + 2; p < len(s); p++ {
+		switch {
+		case inSingle:
+			if s[p] == '\'' {
+				inSingle = false
+			}
+		case inDouble:
+			if s[p] == '\\' && p+1 < len(s) {
+				p++
+			} else if s[p] == '"' {
+				inDouble = false
+			}
+		default:
+			switch s[p] {
+			case '\\':
+				if p+1 < len(s) {
+					p++
+				}
+			case '\'':
+				inSingle = true
+			case '"':
+				inDouble = true
+			case '(':
+				depth++
+			case ')':
+				if depth > 0 {
+					depth--
+					continue
+				}
+				if p+1 < len(s) && s[p+1] == ')' {
+					return strings.TrimSpace(s[p+2:]) == ""
+				}
+				return false
+			}
+		}
+	}
+	return false
+}
+
+func isBashStandaloneOpenBrace(curStr string, nextByte byte, hasNext bool) bool {
+	if hasNext && nextByte != ' ' && nextByte != '\t' && nextByte != '\n' && nextByte != '(' {
+		return false
+	}
+	endsSpace := curStr == "" || curStr[len(curStr)-1] == ' ' || curStr[len(curStr)-1] == '\t'
+	endsParen := curStr != "" && curStr[len(curStr)-1] == ')'
+	if !endsSpace && !endsParen {
+		return false
+	}
+	rest := strings.Trim(curStr, " \t")
+	if rest == "" {
+		return endsSpace
+	}
+	inTimeOpts := false
+	k := 0
+	for k < len(rest) {
+		for k < len(rest) && (rest[k] == ' ' || rest[k] == '\t') {
+			k++
+		}
+		if k >= len(rest) {
+			break
+		}
+		tokEnd := k
+		for tokEnd < len(rest) && rest[tokEnd] != ' ' && rest[tokEnd] != '\t' && rest[tokEnd] != '(' {
+			tokEnd++
+		}
+		if tokEnd == k {
+			break
+		}
+		tok := rest[k:tokEnd]
+		hasAttachedParen := tokEnd < len(rest) && rest[tokEnd] == '('
+		if inTimeOpts {
+			if !hasAttachedParen && tok == "-p" {
+				k = tokEnd
+				continue
+			}
+			if !hasAttachedParen && tok == "--" {
+				inTimeOpts = false
+				k = tokEnd
+				continue
+			}
+			inTimeOpts = false
+		}
+		if !hasAttachedParen {
+			switch tok {
+			case "if", "then", "else", "elif", "do", "while", "until", "!":
+				k = tokEnd
+				continue
+			case "time":
+				inTimeOpts = true
+				k = tokEnd
+				continue
+			}
+		}
+		break
+	}
+	if k >= len(rest) {
+		return endsSpace
+	}
+	rem := strings.TrimSpace(rest[k:])
+	if matchesBashForArithHeader(rem) {
+		return true
+	}
+	fields := strings.Fields(rem)
+	switch fields[0] {
+	case "coproc":
+		if !endsSpace {
+			return false
+		}
+		return len(fields) == 1 || (len(fields) == 2 && isBashIdentWord(fields[1]) && !isBashReservedKeyword(fields[1]))
+	case "function":
+		afterFunc := strings.TrimLeft(rem[len("function"):], " \t")
+		if name, hasParens := trimTrailingEmptyParens(afterFunc); hasParens {
+			return isBashUnquotedWord(name)
+		}
+		return endsSpace && isBashUnquotedWord(afterFunc)
+	default:
+		if name, hasParens := trimTrailingEmptyParens(rem); hasParens {
+			return isBashUnquotedWord(name) && !isBashReservedKeyword(name)
+		}
+		return false
+	}
 }
 
 func isBashStandaloneCloseBrace(curStr string, nextByte byte, hasNext bool) bool {
