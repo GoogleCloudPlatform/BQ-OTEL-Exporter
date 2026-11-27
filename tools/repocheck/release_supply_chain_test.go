@@ -8659,7 +8659,20 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{name: "then_f_space_parens", curStr: "then f () ", nextByte: ' ', hasNext: true, want: true},
 				{name: "for_arith", curStr: "for ((i=0; i<1; i++)) ", nextByte: ' ', hasNext: true, want: true},
 				{name: "then_for_arith_nospace", curStr: "then for((i=0;i<1;i++))", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do", curStr: "for ((i=0; i<1; i++)) do ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do_nospace", curStr: "for ((i=0; i<1; i++))do ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do_function_f", curStr: "for ((i=0; i<1; i++)) do function f ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do_coproc", curStr: "for ((i=0; i<1; i++)) do coproc ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do_coproc_time", curStr: "for ((i=0; i<1; i++)) do coproc time ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do_f_parens", curStr: "for ((i=0; i<1; i++)) do f() ", nextByte: ' ', hasNext: true, want: true},
+				{name: "for_arith_do_time_dd_bang", curStr: "for ((i=0; i<1; i++)) do time -- ! ", nextByte: ' ', hasNext: true, want: true},
+				{name: "coproc_time", curStr: "coproc time ", nextByte: ' ', hasNext: true, want: true},
+				{name: "ws_nl_space", curStr: "\n ", nextByte: ' ', hasNext: true, want: true},
+				{name: "ws_cr_space", curStr: "\r ", nextByte: ' ', hasNext: true, want: true},
+				{name: "ws_then_cr_space", curStr: "then \r ", nextByte: ' ', hasNext: true, want: true},
+				{name: "ws_crlf", curStr: "\r\n", nextByte: ' ', hasNext: true, want: true},
 				{name: "neg_echo", curStr: "echo ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_echo_cr_space", curStr: "echo \r ", nextByte: ' ', hasNext: true, want: false},
 				{name: "neg_foo_bar", curStr: "foo bar ", nextByte: ' ', hasNext: true, want: false},
 				{name: "neg_time_p_echo", curStr: "time -p echo ", nextByte: ' ', hasNext: true, want: false},
 				{name: "neg_time_dd_dash_p", curStr: "time -- -p ", nextByte: ' ', hasNext: true, want: false},
@@ -8671,6 +8684,9 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{name: "neg_cmdsubst_space", curStr: "$(true) ", nextByte: ' ', hasNext: true, want: false},
 				{name: "neg_for_var_in", curStr: "for x in a ", nextByte: ' ', hasNext: true, want: false},
 				{name: "neg_for_arith_junk", curStr: "for ((i=0; i<1; i++)) junk ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_for_arith_echo", curStr: "for ((i=0; i<1; i++)) echo ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_for_arith_do_echo", curStr: "for ((i=0; i<1; i++)) do echo ", nextByte: ' ', hasNext: true, want: false},
+				{name: "neg_for_arith_do_no_trailing_space", curStr: "for ((i=0; i<1; i++))do", nextByte: ' ', hasNext: true, want: false},
 			} {
 				if got := isBashStandaloneOpenBrace(tc.curStr, tc.nextByte, tc.hasNext); got != tc.want {
 					t.Fatalf("%s: isBashStandaloneOpenBrace(%q, %q, %v) = %v, want %v", tc.name, tc.curStr, tc.nextByte, tc.hasNext, got, tc.want)
@@ -9397,6 +9413,20 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"for ((i=0; i<1; i++)) { set +e; }",
 				"time -- function f { set +e; }; f",
 				"if true; then time -p -- ! coproc mycp { set +e; }; wait; fi",
+				"for ((i=0; i<1; i++)) do { set +e; }; done",
+				"for ((i=0; i<1; i++))do { set +e; }; done",
+				"for ((i=0; i<1; i++)) do function f { set +e; }; f; done",
+				"for ((i=0; i<1; i++)) do coproc { set +e; }; wait; done",
+				"for ((i=0; i<1; i++)) do f() { set +e; }; f; done",
+				"for ((i=0; i<1; i++)) do time -- ! { set +e; }; done",
+				"coproc time { set +e; false; }; wait",
+				"coproc eval 'set +e; false'; wait",
+				"coproc set +e; wait",
+				"coproc builtin set +e; wait",
+				"coproc command set +e; wait",
+				"coproc shopt -u -o errexit; wait",
+				"if true; then coproc set +e; fi",
+				"x=\"$(coproc time { case x in x) : '\"\n# '; set +e\n;; esac; })\" # \"",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -9476,6 +9506,13 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"if true; then function f { echo ok; }; f; fi",
 				"if true; then coproc { echo ok; }; wait; fi",
 				"time -- ! { echo ok; }",
+				"for ((i=0; i<1; i++)) do { echo ok; }; done",
+				"for ((i=0; i<1; i++)) echo { set +e; }",
+				"coproc echo ok; wait",
+				"coproc echo set +e; wait",
+				"coproc time { echo ok; }; wait",
+				"coproc set { echo ok; }; wait",
+				"coproc mycp set +e; wait",
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
@@ -16840,6 +16877,10 @@ func isBashIdentWord(s string) bool {
 	return true
 }
 
+func isBashWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\v' || b == '\f'
+}
+
 func isBashUnquotedWord(s string) bool {
 	if s == "" {
 		return false
@@ -16857,25 +16898,25 @@ func trimTrailingEmptyParens(s string) (name string, ok bool) {
 		return "", false
 	}
 	j := len(s) - 1
-	for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t') {
+	for j > 0 && isBashWhitespace(s[j-1]) {
 		j--
 	}
 	if j == 0 || s[j-1] != '(' {
 		return "", false
 	}
-	return strings.TrimRight(s[:j-1], " \t"), true
+	return strings.TrimSpace(s[:j-1]), true
 }
 
-func matchesBashForArithHeader(s string) bool {
-	if !strings.HasPrefix(s, "for") || len(s) <= 3 || (s[3] != ' ' && s[3] != '\t' && s[3] != '(') {
-		return false
+func consumeBashForArithHeader(s string) (endIdx int, ok bool) {
+	if !strings.HasPrefix(s, "for") || len(s) <= 3 || (!isBashWhitespace(s[3]) && s[3] != '(') {
+		return 0, false
 	}
 	arithStart := 3
-	for arithStart < len(s) && (s[arithStart] == ' ' || s[arithStart] == '\t') {
+	for arithStart < len(s) && isBashWhitespace(s[arithStart]) {
 		arithStart++
 	}
 	if arithStart+1 >= len(s) || s[arithStart] != '(' || s[arithStart+1] != '(' {
-		return false
+		return 0, false
 	}
 	depth := 0
 	var inSingle, inDouble bool
@@ -16909,39 +16950,39 @@ func matchesBashForArithHeader(s string) bool {
 					continue
 				}
 				if p+1 < len(s) && s[p+1] == ')' {
-					return strings.TrimSpace(s[p+2:]) == ""
+					return p + 2, true
 				}
-				return false
+				return 0, false
 			}
 		}
 	}
-	return false
+	return 0, false
 }
 
 func isBashStandaloneOpenBrace(curStr string, nextByte byte, hasNext bool) bool {
 	if hasNext && nextByte != ' ' && nextByte != '\t' && nextByte != '\n' && nextByte != '(' {
 		return false
 	}
-	endsSpace := curStr == "" || curStr[len(curStr)-1] == ' ' || curStr[len(curStr)-1] == '\t'
+	endsSpace := curStr == "" || isBashWhitespace(curStr[len(curStr)-1])
 	endsParen := curStr != "" && curStr[len(curStr)-1] == ')'
 	if !endsSpace && !endsParen {
 		return false
 	}
-	rest := strings.Trim(curStr, " \t")
+	rest := strings.TrimSpace(curStr)
 	if rest == "" {
 		return endsSpace
 	}
 	inTimeOpts := false
 	k := 0
 	for k < len(rest) {
-		for k < len(rest) && (rest[k] == ' ' || rest[k] == '\t') {
+		for k < len(rest) && isBashWhitespace(rest[k]) {
 			k++
 		}
 		if k >= len(rest) {
 			break
 		}
 		tokEnd := k
-		for tokEnd < len(rest) && rest[tokEnd] != ' ' && rest[tokEnd] != '\t' && rest[tokEnd] != '(' {
+		for tokEnd < len(rest) && !isBashWhitespace(rest[tokEnd]) && rest[tokEnd] != '(' {
 			tokEnd++
 		}
 		if tokEnd == k {
@@ -16961,6 +17002,28 @@ func isBashStandaloneOpenBrace(curStr string, nextByte byte, hasNext bool) bool 
 			}
 			inTimeOpts = false
 		}
+		if tok == "for" {
+			arithEnd, ok := consumeBashForArithHeader(rest[k:])
+			if !ok {
+				break
+			}
+			next := k + arithEnd
+			for next < len(rest) && isBashWhitespace(rest[next]) {
+				next++
+			}
+			if next >= len(rest) {
+				return true
+			}
+			doEnd := next
+			for doEnd < len(rest) && !isBashWhitespace(rest[doEnd]) && rest[doEnd] != '(' {
+				doEnd++
+			}
+			if rest[next:doEnd] == "do" && (doEnd >= len(rest) || rest[doEnd] != '(') {
+				k = doEnd
+				continue
+			}
+			break
+		}
 		if !hasAttachedParen {
 			switch tok {
 			case "if", "then", "else", "elif", "do", "while", "until", "!":
@@ -16978,18 +17041,18 @@ func isBashStandaloneOpenBrace(curStr string, nextByte byte, hasNext bool) bool 
 		return endsSpace
 	}
 	rem := strings.TrimSpace(rest[k:])
-	if matchesBashForArithHeader(rem) {
-		return true
-	}
 	fields := strings.Fields(rem)
+	if len(fields) == 0 {
+		return endsSpace
+	}
 	switch fields[0] {
 	case "coproc":
 		if !endsSpace {
 			return false
 		}
-		return len(fields) == 1 || (len(fields) == 2 && isBashIdentWord(fields[1]) && !isBashReservedKeyword(fields[1]))
+		return len(fields) == 1 || (len(fields) == 2 && isBashIdentWord(fields[1]) && (fields[1] == "time" || !isBashReservedKeyword(fields[1])))
 	case "function":
-		afterFunc := strings.TrimLeft(rem[len("function"):], " \t")
+		afterFunc := strings.TrimSpace(rem[len("function"):])
 		if name, hasParens := trimTrailingEmptyParens(afterFunc); hasParens {
 			return isBashUnquotedWord(name)
 		}
@@ -18263,7 +18326,7 @@ func stepStatementsDisableErrexit(stmts, backticks []string, depth int) bool {
 			switch {
 			case fields[0].text == "if" || fields[0].text == "then" || fields[0].text == "do" ||
 				fields[0].text == "else" || fields[0].text == "elif" || fields[0].text == "while" ||
-				fields[0].text == "until" || fields[0].text == "!":
+				fields[0].text == "until" || fields[0].text == "!" || fields[0].text == "coproc":
 				fields = fields[1:]
 			case fields[0].text == "time":
 				fields = stripBashRedirArgs(fields[1:], false)
