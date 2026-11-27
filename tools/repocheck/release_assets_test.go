@@ -1669,6 +1669,10 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		"(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; false; echo BYPASSED; true <<$'EO\\nF' )\n: )",
 		"echo \"$(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF')\n\"",
 		"case x in x)\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'\n;;\nesac",
+		"x=\"$(case esac in (esac) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo FULL_BYPASS >&2\n;; esac)\" # \"",
+		"x=\"$(case esac in a|esac) : '\"\n# '; set +e; false; echo ALT_BYPASS >&2\n;; esac)\" # \"",
+		"case x in \"${UNSET:-'a}\"'}\"| # '|x) set +e; true <<$'EO\\nF' ;;\nx) echo ok ;;\nesac",
+		"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\n$(true <<$'EO\\nF')\nEOF\n)",
 	}
 	for _, run := range badSteps {
 		err := gateCrossOSStep(crossOSMatrixStep{Name: "test", Shell: "bash", Run: run}, false)
@@ -1684,6 +1688,11 @@ func TestGateCrossOSStepErrexitGuards(t *testing.T) {
 		"echo \"${UNSET:-'a}\"'}\"\n# benign comment",
 		"echo \"${UNSET:-'a}\"'}\"\n# benign set +e",
 		"(\necho \"${UNSET:-'a}\"'}\"\n# benign comment\n)",
+		`x="$(case esac in (esac) echo ok ;; esac)"`,
+		`x="$(case esac in a|esac) echo ok ;; esac)"`,
+		`x="$(case x in esac)"`,
+		`case x in "${UNSET:-'a'}") echo ok ;; esac`,
+		"( echo \"${PWD:-'${'}\" ; cat <<EOF\nset +e\nEOF\n)",
 		`echo "$(case a in a) echo "set +e";; esac)"`,
 		"echo \"`echo 'set +e'`\"",
 		"x=\"`echo \\`echo \\\"a'b\\\"\\` `\"\necho ok",
@@ -1996,9 +2005,7 @@ func (sc *crossOSScriptScanner) probeTrailingBackslashReachedTopLevel(idx int, p
 		return false
 	}
 	tmp := sc.state.cloneForLineProbe()
-	if sc.logicalBuf == "" {
-		tmp.arithMemo = sc.state.arithMemo
-	}
+	tmp.lineIdx = idx
 	_, _ = tmp.activeLine(sc.logicalBuf + phys)
 	return tmp.reachedTopLevelInCall
 }

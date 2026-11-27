@@ -887,6 +887,7 @@ type bashLexFrame struct {
 	kind                    bashFrameKind
 	parenDepth              int
 	inPattern               bool
+	canCloseEsac            bool
 	extglobDepth            int
 	caseStage               bashCaseStage
 	cmdStarted              bool
@@ -2100,8 +2101,14 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 	atLineStart := startIdx == 0 && (!stopOnEmpty || len(s.lines) > 0)
 	if atLineStart {
 		if earlyQ := s.nextEarlyHeredocQueue(); earlyQ != nil {
-			if expanded, closed := s.consumeHereDocLine(earlyQ, line); closed && !stopOnEmpty && len(expanded) > 0 {
-				return strings.Join(expanded, "\n"), true, -1
+			prevErr := s.heredocOpenError
+			if expanded, closed := s.consumeHereDocLine(earlyQ, line); closed && !stopOnEmpty {
+				if len(expanded) > 0 || (!prevErr && s.heredocOpenError) {
+					s.reachedTopLevelInCall = true
+				}
+				if len(expanded) > 0 {
+					return strings.Join(expanded, "\n"), true, -1
+				}
 			}
 			return "", false, -1
 		}
@@ -2138,8 +2145,14 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		justClosedBacktick = true
 	} else if atLineStart {
 		if _, queue, scopeIdx := s.activeHeredocScope(); len(*queue) > 0 && !s.hasWordFrameAbove(scopeIdx) {
-			if expanded, closed := s.consumeHereDocLine(queue, line); closed && !stopOnEmpty && len(expanded) > 0 {
-				return strings.Join(expanded, "\n"), true, -1
+			prevErr := s.heredocOpenError
+			if expanded, closed := s.consumeHereDocLine(queue, line); closed && !stopOnEmpty {
+				if (len(expanded) > 0 || (!prevErr && s.heredocOpenError)) && s.inExecCodeContext() {
+					s.reachedTopLevelInCall = true
+				}
+				if len(expanded) > 0 {
+					return strings.Join(expanded, "\n"), true, -1
+				}
 			}
 			return "", false, -1
 		}
@@ -2418,30 +2431,37 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 			continue
 		}
 		if top == bashFrameCase && s.frames[len(s.frames)-1].inPattern {
+			last := len(s.frames) - 1
 			switch ch {
 			case '\\':
+				s.frames[last].canCloseEsac = false
 				if i+1 < len(line) {
 					i++
 				}
 				atWordStart = false
 			case '\'':
+				s.frames[last].canCloseEsac = false
 				s.pushFrame(bashFrameSingle)
 				atWordStart = false
 			case '"':
+				s.frames[last].canCloseEsac = false
 				s.pushFrame(bashFrameDouble)
 				atWordStart = false
 			case '`':
+				s.frames[last].canCloseEsac = false
 				i = s.consumeBacktickStart(line, i, false, stopOnEmpty, &copiedUpTo, &hasStripped, &strippedCode)
 				atWordStart = false
 			case '$':
+				s.frames[last].canCloseEsac = false
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '(':
+				s.frames[last].canCloseEsac = false
 				if i > 0 && strings.ContainsRune("@?*+!", rune(line[i-1])) {
-					s.frames[len(s.frames)-1].extglobDepth++
+					s.frames[last].extglobDepth++
 				}
 				atWordStart = true
 			case ')':
-				last := len(s.frames) - 1
+				s.frames[last].canCloseEsac = false
 				if s.frames[last].extglobDepth > 0 {
 					s.frames[last].extglobDepth--
 					atWordStart = false
@@ -2449,22 +2469,30 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 					s.frames[last].inPattern = false
 					s.frames[last].cmdStarted = false
 					s.frames[last].assignDisallowed = false
+					if !stopOnEmpty {
+						s.scanPoppedToTopLevel = true
+					}
 					atWordStart = true
 				}
 			default:
 				if atWordStart && isBashWordIdentChar(ch) {
+					canClose := s.frames[last].canCloseEsac
+					s.frames[last].canCloseEsac = false
 					start := i
 					for i+1 < len(line) && isBashWordIdentChar(line[i+1]) {
 						i++
 					}
 					word := line[start : i+1]
 					atBoundary := i+1 == len(line) || isBashKeywordBoundary(line[i+1])
-					if atBoundary && word == "esac" {
+					if canClose && atBoundary && word == "esac" {
 						s.popFrame()
 						s.noteWordCompleted()
 					}
 					atWordStart = false
 					continue
+				}
+				if ch != ' ' && ch != '\t' {
+					s.frames[last].canCloseEsac = false
 				}
 				atWordStart = ch == ' ' || ch == '\t' || ch == '|'
 			}
@@ -2583,6 +2611,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 				}
 				last := len(s.frames) - 1
 				s.frames[last].inPattern = true
+				s.frames[last].canCloseEsac = true
 				s.frames[last].cmdStarted = false
 				s.frames[last].assignDisallowed = false
 				s.frames[last].afterTime = false
@@ -2635,7 +2664,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 						s.setCmdStart(false)
 						s.setAssignDisallowed(true)
 						s.setAfterTime(false)
-						s.frames = append(s.frames, bashLexFrame{kind: bashFrameCase, inPattern: true})
+						s.frames = append(s.frames, bashLexFrame{kind: bashFrameCase, inPattern: true, canCloseEsac: true})
 						handled = true
 					case top == bashFrameCase && s.atCmdStart() && word == "esac":
 						s.popFrame()
@@ -2691,7 +2720,7 @@ func (s *bashScanState) scanLine(line string, startIdx int, stopOnEmpty bool, lo
 		s.setCmdStart(true)
 		s.setAfterTime(false)
 	}
-	if !stopOnEmpty && (sawTopLevelCodeByte || justClosedBacktick) && s.inExecCodeContext() && !s.inHereDocBody() {
+	if !stopOnEmpty && (sawTopLevelCodeByte || justClosedBacktick || s.scanPoppedToTopLevel) && s.inExecCodeContext() {
 		s.reachedTopLevelInCall = true
 	}
 	if stopOnEmpty {
@@ -8210,6 +8239,8 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; false; echo BYPASSED; true <<$'EO\\nF' )\n: )",
 				"echo \"$(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF')\n\"",
 				"case x in x)\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'\n;;\nesac",
+				"case x in \"${UNSET:-'a}\"'}\"| # '|x) set +e; true <<$'EO\\nF' ;;\nx) echo ok ;;\nesac",
+				"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\n$(true <<$'EO\\nF')\nEOF\n)",
 			} {
 				lines, err := activeBashCodeLinesChecked(passErrSrc)
 				if err == nil {
@@ -8218,6 +8249,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "set +e") {
 					t.Fatalf("activeBashCodeLinesChecked(%q) missed set +e in %q", passErrSrc, joined)
 				}
+			}
+			item3ManifestCosignErr := "( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nvalidate_existing_manifest foo || true; cosign verify --certificate-identity-regexp=.* <<EOF\n$(true <<$'EO\\nF')\nEOF\n)"
+			if lines, err := activeBashCodeLinesChecked(item3ManifestCosignErr); err == nil {
+				t.Fatalf("activeBashCodeLinesChecked(%q) unexpectedly succeeded: %q", item3ManifestCosignErr, lines)
+			} else if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "validate_existing_manifest foo || true") || !strings.Contains(joined, "--certificate-identity-regexp=.*") {
+				t.Fatalf("activeBashCodeLinesChecked(%q) missed exposed lines in %q", item3ManifestCosignErr, joined)
 			}
 			for _, unclosedPass2ExposedSrc := range []struct {
 				src  string
@@ -8238,6 +8275,18 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{
 					src:  "x=\"`\necho \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; cosign verify --certificate-identity-regexp '.*'\n`\"",
 					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(case esac in (esac) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo FULL_BYPASS >&2\n;; esac)\" # \"",
+					want: "--certificate-identity-regexp",
+				},
+				{
+					src:  "x=\"$(case esac in (esac) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo FULL_BYPASS >&2\n;; esac)\" # \"",
+					want: "validate_existing_manifest foo || true",
+				},
+				{
+					src:  "( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nvalidate_existing_manifest foo || true; cosign verify --certificate-identity-regexp=.* <<EOF\nbody\nEOF\n)",
+					want: "--certificate-identity-regexp=.*",
 				},
 			} {
 				lines, err := activeBashCodeLinesChecked(unclosedPass2ExposedSrc.src)
@@ -8272,6 +8321,9 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"(\necho \"${UNSET:-'a}\"'}\"\n# '; echo evil \\\necho ok\n)",
 				"x=\"`\necho \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; echo evil \\\necho ok\n`\"",
 				"x=\"`\necho ok\n`\"; echo evil \\\necho ok",
+				"x=\"$(case esac in (esac) : '\"\n# '; echo BYPASSED_CONT_LINE1 \\\necho BYPASSED_CONT_LINE2 >&2\n;; esac)\" # \"",
+				"x=\"`\n(( 1 + 2 )); echo \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\";   (( echo evil ) \\\n)\n`\"",
+				"x=\"`\n(( 1 +\n2 )); echo \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; (( echo evil ) \\\n)\n`\"",
 			} {
 				if lines, err := normalizeCrossOSScriptLines(normErrSrc); err == nil {
 					t.Fatalf("normalizeCrossOSScriptLines(%q) unexpectedly succeeded: %q", normErrSrc, lines)
@@ -8283,6 +8335,10 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 			for _, benignContainerComment := range []string{
 				"(\necho \"${UNSET:-'a}\"'}\"\n# benign comment\n)",
 				"(\necho \"${UNSET:-'a\"b'}\"\n# benign comment: cosign verify --certificate-identity-regexp '.*'\n)",
+				"x=\"$(case esac in (esac) echo ok ;; esac)\"\n# benign comment",
+				"x=\"$(case esac in a|esac) echo ok ;; esac)\"\n# benign comment",
+				"x=\"$(case x in esac)\"\n# benign comment",
+				"case x in \"\"esac) echo ok ;; \\esac) echo ok ;; esac\n# benign comment",
 			} {
 				if lines, err := activeBashCodeLinesChecked(benignContainerComment); err != nil || strings.Contains(strings.Join(lines, "\n"), "benign comment") {
 					t.Fatalf("activeBashCodeLinesChecked(%q) = (%q, %v), want benign comment stripped", benignContainerComment, lines, err)
@@ -8653,6 +8709,11 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"echo \"$(\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF')\n\"",
 				"case x in x)\necho \"${UNSET:-'a}\"'}\"\n# '; set +e; true <<$'EO\\nF'\n;;\nesac",
 				"x=\"`\necho \\\"${UNSET:-'a\\\"b'}\\\"\n# }\\\"; set +e\n`\"",
+				"x=\"$(case esac in (esac) : '\"\n# '; cosign verify --certificate-identity-regexp '.*' >&2; validate_existing_manifest foo || true; set +e; false; echo FULL_BYPASS >&2\n;; esac)\" # \"",
+				"x=\"$(case esac in a|esac) : '\"\n# '; set +e; false; echo ALT_BYPASS >&2\n;; esac)\" # \"",
+				"case x in \"${UNSET:-'a}\"'}\"| # '|x) set +e; true <<$'EO\\nF' ;;\nx) echo ok ;;\nesac",
+				"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\n$(true <<$'EO\\nF')\nEOF\n)",
+				"( echo \"${UNSET:-'a}\"'}\" ; cat <<'EOF'\n'\nset +e; false; echo BYPASSED_PASS2_CLEAN >&2; true <<EOF\nbody\nEOF\n)",
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -8688,6 +8749,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"echo \"${UNSET:-'a}\"'}\"\n# benign comment",
 				"echo \"${UNSET:-'a}\"'}\"\n# benign set +e",
 				"(\necho \"${UNSET:-'a}\"'}\"\n# benign comment\n)",
+				"x=\"$(case esac in (esac) echo ok ;; esac)\"",
+				"x=\"$(case esac in a|esac) echo ok ;; esac)\"",
+				"x=\"$(case x in esac)\"",
+				"case x in \"\"esac) echo ok ;; \\esac) echo ok ;; esac",
+				"case x in \"${UNSET:-'a'}\") echo ok ;; esac",
+				"( echo \"${PWD:-'${'}\" ; cat <<EOF\nset +e\nEOF\n)",
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
