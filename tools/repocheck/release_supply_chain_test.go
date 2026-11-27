@@ -8651,12 +8651,28 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				{name: "unsplit_coproc_mycp_for_attached_all_nospace", cur: "coproc mycp for((i=0; i<1; i++))do set +e", want: true},
 				{name: "unsplit_nested_for_arith_do", cur: "for ((i=0; i<1; i++)) do for ((j=0; j<1; j++)) do set +e", want: true},
 				{name: "unsplit_time_coproc_mycp_for_do", cur: "time -p -- coproc mycp for((i=0; i<1; i++))do set +e", want: true},
+				{name: "unsplit_for_arith_do_gt", cur: "for ((i=0; i<1; i++)) do>/dev/null set +e", want: true},
+				{name: "unsplit_for_arith_do_lt", cur: "for ((i=0; i<1; i++)) do</dev/null set +e", want: true},
+				{name: "unsplit_for_arith_do_gtgt", cur: "for ((i=0; i<1; i++)) do>>/dev/null set +e", want: true},
+				{name: "unsplit_for_arith_do_ampgt", cur: "for((i=0; i<1; i++))do&>/dev/null set +e", want: true},
+				{name: "unsplit_coproc_mycp_for_do_gt", cur: "coproc mycp for ((i=0; i<1; i++)) do>/dev/null set +e", want: true},
+				{name: "unsplit_for_arith_do_gt_nested_for", cur: "for ((i=0; i<1; i++)) do>/dev/null for ((j=0; j<1; j++)) do</dev/null set +e", want: true},
+				{name: "unsplit_for_attached_assoc_dq", cur: `for((a["k"]=0; a["k"]<1; a["k"]++)) do set +e`, want: true},
+				{name: "unsplit_for_attached_assoc_sq", cur: `for((a['k']=0; a['k']<1; a['k']++)) do set +e`, want: true},
+				{name: "unsplit_for_attached_assoc_rparen", cur: `for((a[")"]=0; a[")"]<1; a[")"]++)) do set +e`, want: true},
+				{name: "unsplit_for_attached_assoc_esc", cur: `for((a[\)]=0; a[\)]<1; a[\)]++)) do set +e`, want: true},
+				{name: "unsplit_coproc_mycp_for_attached_assoc_dq", cur: `coproc mycp for((a["k"]=0; a["k"]<1; a["k"]++)) do set +e`, want: true},
 				{name: "unsplit_neg_quoted_for", cur: "\"for\" ((i=0; i<1; i++)) do set +e", want: false},
+				{name: "unsplit_neg_quoted_for_attached", cur: `"for"((i=0; i<1; i++)) do set +e`, want: false},
+				{name: "unsplit_neg_for_sq_paren", cur: `for'('((i=0; i<1; i++)) do set +e`, want: false},
+				{name: "unsplit_neg_brace_for_attached", cur: `{for,x}((i=0; i<1; i++)) do set +e`, want: false},
+				{name: "unsplit_neg_quoted_do_gt", cur: `for ((i=0; i<1; i++)) "do">/dev/null set +e`, want: false},
 				{name: "unsplit_neg_for_in", cur: "for x in a", want: false},
 				{name: "unsplit_neg_for_no_do", cur: "for ((i=0; i<1; i++)) echo set +e", want: false},
 				{name: "unsplit_neg_coproc_quoted_if", cur: "coproc echo \"if\" set +e", want: false},
 				{name: "unsplit_neg_coproc_mycp_quoted_if", cur: "coproc mycp \"if\" set +e", want: false},
 				{name: "unsplit_neg_coproc_quoted_for", cur: "coproc mycp \"for\" ((i=0; i<1; i++)) do set +e", want: false},
+				{name: "unsplit_neg_coproc_brace_for_attached", cur: `coproc mycp {for,x}((i=0; i<1; i++)) do set +e`, want: false},
 			} {
 				if got := stepStatementsDisableErrexit([]string{tc.cur}, nil, 0); got != tc.want {
 					t.Fatalf("%s: stepStatementsDisableErrexit([%q]) = %v, want %v", tc.name, tc.cur, got, tc.want)
@@ -9494,6 +9510,14 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"coproc mycp for((i=0; i<1; i++)) do set +e; done; wait",
 				"coproc mycp for((i=0; i<1; i++))do set +e; done; wait",
 				"for ((i=0; i<1; i++)) do for ((j=0; j<1; j++)) do set +e; done; done",
+				"for ((i=0; i<1; i++)) do>/dev/null set +e; done",
+				"for ((i=0; i<1; i++)) do</dev/null set +e; done",
+				"for ((i=0; i<1; i++)) do>>/dev/null set +e; done",
+				"for((i=0; i<1; i++))do&>/dev/null set +e; done",
+				"coproc mycp for ((i=0; i<1; i++)) do>/dev/null set +e; done; wait",
+				`declare -A a; for((a["k"]=0; a["k"]<1; a["k"]++)) do set +e; done`,
+				`declare -A a; for((a['k']=0; a['k']<1; a['k']++)) do set +e; done`,
+				`declare -A a; coproc mycp for((a["k"]=0; a["k"]<1; a["k"]++)) do set +e; done; wait`,
 			} {
 				if !stepDisablesErrexit(badErrexit) {
 					t.Fatalf("stepDisablesErrexit missed errexit bypass: %q", badErrexit)
@@ -9589,6 +9613,12 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 				"coproc mycp for ((i=0; i<1; i++)) do echo ok; done; wait",
 				"coproc echo \"if\" set +e; wait",
 				"coproc mycp \"if\" set +e; wait",
+				"for ((i=0; i<1; i++)) do>/dev/null echo ok; done",
+				`for ((i=0; i<1; i++)) "do">/dev/null set +e; done`,
+				`declare -A a; for((a["k"]=0; a["k"]<1; a["k"]++)) do echo ok; done`,
+				`"for"((i=0; i<1; i++))`,
+				`for'('((i=0; i<1; i++))`,
+				`{for,x}((i=0; i<1; i++))`,
 				`set "${!UNSET_PREFIX_XYZ*}" +e`,
 				`set "${!BASH_VERSINFO[@]:99}" +e`,
 				`set "${!BASH_CMDS[@]:99}" +e`,
@@ -18445,14 +18475,18 @@ func joinBashWordTexts(words []bashWord) string {
 	return strings.Join(parts, " ")
 }
 
-func isBashCoprocCompoundField(f bashWord, curStmt string) bool {
-	if f.quoted {
+func isBashForArithStart(f bashWord, curStmt string) bool {
+	if f.rawStart < 0 || f.rawStart >= len(curStmt) {
 		return false
 	}
+	return (!f.quoted && f.text == "for") || strings.HasPrefix(curStmt[f.rawStart:], "for((")
+}
+
+func isBashCoprocCompoundField(f bashWord, curStmt string) bool {
 	switch {
-	case f.text == "if", f.text == "while", f.text == "until":
+	case !f.quoted && (f.text == "if" || f.text == "while" || f.text == "until"):
 		return true
-	case f.text == "for", strings.HasPrefix(f.text, "for("):
+	case isBashForArithStart(f, curStmt):
 		_, ok := consumeBashForArithHeader(curStmt[f.rawStart:])
 		return ok
 	default:
@@ -18471,19 +18505,20 @@ func stepStatementsDisableErrexit(stmts, backticks []string, depth int) bool {
 				fields[0].text == "else" || fields[0].text == "elif" || fields[0].text == "while" ||
 				fields[0].text == "until" || fields[0].text == "!"):
 				fields = fields[1:]
-			case !fields[0].quoted && (fields[0].text == "for" || strings.HasPrefix(fields[0].text, "for(")):
+			case isBashForArithStart(fields[0], curStmt):
 				arithEnd, ok := consumeBashForArithHeader(curStmt[fields[0].rawStart:])
 				if !ok {
 					stripping = false
 					break
 				}
-				doTok, _, doEnd, doParen := readBashSpaceToken(curStmt, fields[0].rawStart+arithEnd)
-				if doTok != "do" || doParen {
+				rest := curStmt[fields[0].rawStart+arithEnd:]
+				restFields := splitBashWordsForErrexit(rest)
+				if len(restFields) == 0 || restFields[0].quoted || restFields[0].text != "do" {
 					stripping = false
 					break
 				}
-				curStmt = curStmt[doEnd:]
-				fields = splitBashWordsForErrexit(curStmt)
+				curStmt = rest
+				fields = restFields[1:]
 			case !fields[0].quoted && fields[0].text == "coproc":
 				if len(fields) >= 3 && !fields[1].quoted && isBashCoprocName(fields[1].text) && isBashCoprocCompoundField(fields[2], curStmt) {
 					fields = fields[2:]
