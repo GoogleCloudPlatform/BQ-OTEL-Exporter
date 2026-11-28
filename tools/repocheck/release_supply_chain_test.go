@@ -18309,14 +18309,13 @@ type bashLineIndex struct {
 	starts               []int
 	inline               [1]string
 	onePos               [1]int
-	builds               int
 	arithMemo            map[uint64]int8
 	failedDoubleParen    map[uint64]bool
 	failedForDoubleParen map[uint64]bool
 }
 
 func newBashLineIndex(src string) *bashLineIndex {
-	idx := &bashLineIndex{builds: 1}
+	idx := &bashLineIndex{arithMemo: make(map[uint64]int8)}
 	if strings.IndexByte(src, '\n') < 0 {
 		idx.inline[0] = src
 		idx.lines = idx.inline[:]
@@ -18359,15 +18358,17 @@ func (idx *bashLineIndex) posToLineCol(pos int) (lineIdx, col int) {
 }
 
 func ensureBashLineIndex(src string, cache **bashLineIndex, builds *int) *bashLineIndex {
+	var idx *bashLineIndex
 	if cache != nil && *cache != nil {
-		return *cache
-	}
-	idx := newBashLineIndex(src)
-	if builds != nil {
-		*builds++
-	}
-	if cache != nil {
-		*cache = idx
+		idx = *cache
+	} else {
+		idx = newBashLineIndex(src)
+		if builds != nil {
+			*builds++
+		}
+		if cache != nil {
+			*cache = idx
+		}
 	}
 	if idx.arithMemo == nil {
 		idx.arithMemo = make(map[uint64]int8)
@@ -19295,7 +19296,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 					i = endIdx
 					continue
 				case '(':
-					if endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.ensureLineCache(), opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+					if endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 						addNestedSrc(inner)
 						cur.WriteString(src[i : endIdx+1])
 						i = endIdx
@@ -19307,7 +19308,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 		case '(':
 			if i+1 < len(src) && src[i+1] == '(' {
 				if isPrefix, isForArith := isBashDoubleParenCmdPrefix(cur.String()); isPrefix {
-					if endIdx, inner, arithClosed, ok := scanBashDoubleParenWithCacheBuilds(src, opts.ensureLineCache(), opts.lineIndexBuilds, i, isForArith, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+					if endIdx, inner, arithClosed, ok := scanBashDoubleParenWithCacheBuilds(src, opts.lineCache, opts.lineIndexBuilds, i, isForArith, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 						flush()
 						if !arithClosed || strings.ContainsAny(inner, "$`") {
 							addNestedSrc(inner)
@@ -19362,7 +19363,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 			flush()
 		case '>', '<':
 			if i+1 < len(src) && src[i+1] == '(' {
-				if endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.ensureLineCache(), opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+				if endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 					addNestedSrc(inner)
 					cur.WriteString(src[i : endIdx+1])
 					i = endIdx
@@ -20295,7 +20296,7 @@ func decodeBashWordWithOpts(raw string, opts bashParamScanOpts) bashWord {
 			}
 		case '<', '>':
 			if i+1 < len(raw) && raw[i+1] == '(' {
-				if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
+				if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(raw, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, nil); ok {
 					cur.WriteString(raw[i : endIdx+1])
 					hasLiteral = true
 					i = endIdx
@@ -22485,8 +22486,16 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				t.Fatalf("offset %d: got (%d, %q, %v)", i, endIdx, inner, ok)
 			}
 		}
-		if csBuilds != 1 || csCache == nil || csCache.builds != 1 || len(csCache.starts) != 3*nOffsets+1 {
+		if csBuilds != 1 || csCache == nil || len(csCache.starts) != 3*nOffsets+1 {
 			t.Fatalf("scanBashCmdSubstWithCache builds = %d (cache=%v), want 1 build with %d line starts", csBuilds, csCache, 3*nOffsets+1)
+		}
+
+		// Cache hit on a pre-existing bashLineIndex with nil arithMemo still initializes arithMemo.
+		hitIdx := &bashLineIndex{lines: []string{"echo $(echo 1)"}, starts: []int{0}}
+		var hitBuilds int
+		gotHitIdx := ensureBashLineIndex("echo $(echo 1)", &hitIdx, &hitBuilds)
+		if gotHitIdx != hitIdx || hitBuilds != 0 || gotHitIdx.arithMemo == nil {
+			t.Fatalf("ensureBashLineIndex cache-hit guard failed: same=%v builds=%d arithMemoNil=%v", gotHitIdx == hitIdx, hitBuilds, gotHitIdx.arithMemo == nil)
 		}
 
 		// 2. Direct scanBashDoubleParenWithCache over N unclosed downgraded (( ) chains builds once.
@@ -22500,56 +22509,59 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				t.Fatalf("unexpected closed (( at offset %d", i)
 			}
 		}
-		if dpBuilds != 1 || dpCache == nil || dpCache.builds != 1 {
+		if dpBuilds != 1 || dpCache == nil {
 			t.Fatalf("scanBashDoubleParenWithCache builds = %d (cache=%v), want 1", dpBuilds, dpCache)
 		}
 
-		// 3. Statement splitting, raw word splitting, word decoding, and brace expansion build once per source.
+		// 3. Production path (lineCache == nil): statement splitting, raw word splitting,
+		// word decoding (including process substitution), and brace expansion each build once per source.
 		stmtSrc := strings.Repeat("x=\"${VAR:-$(printf item)}\"\n", nOffsets)
-		var stmtCache *bashLineIndex
 		var stmtBuilds int
 		stmts, _ := splitBashStatementsForErrexitDepth(stmtSrc, 0, bashParamScanOpts{
 			allowSingleInDouble: true,
-			lineCache:           &stmtCache,
 			lineIndexBuilds:     &stmtBuilds,
 		})
-		if len(stmts) != 2*nOffsets || stmtBuilds != 1 || stmtCache == nil || stmtCache.builds != 1 {
-			t.Fatalf("splitBashStatementsForErrexitDepth len=%d builds=%d cache=%v, want %d stmts and 1 build", len(stmts), stmtBuilds, stmtCache, 2*nOffsets)
+		if len(stmts) != 2*nOffsets || stmtBuilds != 1 {
+			t.Fatalf("splitBashStatementsForErrexitDepth len=%d builds=%d, want %d stmts and 1 build", len(stmts), stmtBuilds, 2*nOffsets)
 		}
 
 		wordLine := "echo" + strings.Repeat(" $(printf 'a\nb')", nOffsets)
-		var wordCache *bashLineIndex
 		var wordBuilds int
 		words := splitRawBashWordsWithOpts(wordLine, bashParamScanOpts{
 			allowSingleInDouble: true,
-			lineCache:           &wordCache,
 			lineIndexBuilds:     &wordBuilds,
 		})
-		if len(words) != nOffsets+1 || wordBuilds != 1 || wordCache == nil || wordCache.builds != 1 {
-			t.Fatalf("splitRawBashWordsWithOpts len=%d builds=%d cache=%v, want %d words and 1 build", len(words), wordBuilds, wordCache, nOffsets+1)
+		if len(words) != nOffsets+1 || wordBuilds != 1 {
+			t.Fatalf("splitRawBashWordsWithOpts len=%d builds=%d, want %d words and 1 build", len(words), wordBuilds, nOffsets+1)
 		}
 
 		quotedWord := `"` + strings.Repeat("$(printf item)\n", nOffsets) + `"`
-		var decCache *bashLineIndex
 		var decBuilds int
 		dw := decodeBashWordWithOpts(quotedWord, bashParamScanOpts{
 			allowSingleInDouble: true,
-			lineCache:           &decCache,
 			lineIndexBuilds:     &decBuilds,
 		})
-		if dw.text == "" || decBuilds != 1 || decCache == nil || decCache.builds != 1 {
-			t.Fatalf("decodeBashWordWithOpts builds=%d cache=%v textLen=%d, want 1 build", decBuilds, decCache, len(dw.text))
+		if dw.text == "" || decBuilds != 1 {
+			t.Fatalf("decodeBashWordWithOpts builds=%d textLen=%d, want 1 build", decBuilds, len(dw.text))
+		}
+
+		procSrc := "<(printf 'a\nb')$(printf 'c\nd')"
+		var procBuilds int
+		procWord := decodeBashWordWithOpts(procSrc, bashParamScanOpts{
+			allowSingleInDouble: true,
+			lineIndexBuilds:     &procBuilds,
+		})
+		if procWord.text != procSrc || procBuilds != 1 {
+			t.Fatalf("decodeBashWordWithOpts(<(...) $(...)) text=%q builds=%d, want %q and 1 build", procWord.text, procBuilds, procSrc)
 		}
 
 		braceSrc := strings.Repeat("$(printf 'x\ny')", nOffsets) + "{a,b}"
-		var braceCache *bashLineIndex
 		var braceBuilds int
 		if brace, ok := findExpandableBashBraceWithOpts(braceSrc, bashParamScanOpts{
 			allowSingleInDouble: true,
-			lineCache:           &braceCache,
 			lineIndexBuilds:     &braceBuilds,
-		}); !ok || len(brace.commas) != 1 || braceBuilds != 1 || braceCache == nil || braceCache.builds != 1 {
-			t.Fatalf("findExpandableBashBraceWithOpts ok=%v builds=%d cache=%v, want ok=true and 1 build", ok, braceBuilds, braceCache)
+		}); !ok || len(brace.commas) != 1 || braceBuilds != 1 {
+			t.Fatalf("findExpandableBashBraceWithOpts ok=%v builds=%d, want ok=true and 1 build", ok, braceBuilds)
 		}
 	})
 

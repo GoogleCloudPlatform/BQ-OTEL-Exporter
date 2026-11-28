@@ -1521,7 +1521,7 @@ func checkCIWorkflowRequiresGawk(ciYAML string) error {
 	}
 	var buildContainer buildContainerConfig
 	if !buildJob.Container.IsZero() {
-		if err := buildContainer.UnmarshalYAML(&buildJob.Container); err != nil {
+		if err := buildJob.Container.Decode(&buildContainer); err != nil {
 			return fmt.Errorf("unmarshaling ci.yml jobs.build.container: %w", err)
 		}
 	}
@@ -3815,6 +3815,27 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 
 	// Regression guard: when build and lint already share a checkout anchor, fixture
 	// builders must reuse it instead of renaming it and leaving lint with an unknown alias.
+	aliasLintCheckoutStep := func(t *testing.T, jobs *yaml.Node, anchorName string, checkoutTarget *yaml.Node) {
+		t.Helper()
+		lintJob := yamlMustMapValue(t, jobs, "lint")
+		lintSteps := yamlMustMapValue(t, lintJob, "steps")
+		lintCheckout, _ := findNamedStepsInJob(t, lintJob)
+		if lintCheckout == nil {
+			t.Fatal("test setup error: missing lint checkout step")
+		}
+		replaced := false
+		for i, step := range lintSteps.Content {
+			if step == lintCheckout {
+				lintSteps.Content[i] = &yaml.Node{Kind: yaml.AliasNode, Value: anchorName, Alias: checkoutTarget}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			t.Fatal("test setup error: lint checkout step was not replaced")
+		}
+	}
+
 	buildAndLintSharedCheckoutYAML := func(t *testing.T, anchorName string) string {
 		t.Helper()
 		doc := parseWorkflowYAMLNode(t, ci)
@@ -3823,15 +3844,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		buildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, jobs, "build"))
 		checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
 		resolvedAnchor := ensureYAMLAnchor(usedAnchors, checkoutTarget, anchorName)
-		lintJob := yamlMustMapValue(t, jobs, "lint")
-		lintSteps := yamlMustMapValue(t, lintJob, "steps")
-		lintCheckout, _ := findNamedStepsInJob(t, lintJob)
-		for i, step := range lintSteps.Content {
-			if step == lintCheckout {
-				lintSteps.Content[i] = &yaml.Node{Kind: yaml.AliasNode, Value: resolvedAnchor, Alias: checkoutTarget}
-				break
-			}
-		}
+		aliasLintCheckoutStep(t, jobs, resolvedAnchor, checkoutTarget)
 		out, err := yaml.Marshal(doc)
 		if err != nil {
 			t.Fatal(err)
@@ -4156,15 +4169,7 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 			buildCheckout, buildSetupGo := findNamedStepsInJob(t, yamlMustMapValue(t, sharedJobs, "build"))
 			checkoutTarget := resolveYAMLAliasReadOnly(buildCheckout)
 			checkoutAnchor := ensureYAMLAnchor(usedAnchors, checkoutTarget, "existing_shared_checkout")
-			lintJob := yamlMustMapValue(t, sharedJobs, "lint")
-			lintSteps := yamlMustMapValue(t, lintJob, "steps")
-			lintCheckout, _ := findNamedStepsInJob(t, lintJob)
-			for i, step := range lintSteps.Content {
-				if step == lintCheckout {
-					lintSteps.Content[i] = &yaml.Node{Kind: yaml.AliasNode, Value: checkoutAnchor, Alias: checkoutTarget}
-					break
-				}
-			}
+			aliasLintCheckoutStep(t, sharedJobs, checkoutAnchor, checkoutTarget)
 			buildWith, ok := yamlMapLookup(buildSetupGo, "with")
 			if !ok || buildWith == nil {
 				t.Fatal("test setup error: build setup-go step missing with mapping")
