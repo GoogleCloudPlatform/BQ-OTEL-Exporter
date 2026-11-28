@@ -5949,7 +5949,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		if slices.Contains(executableReleaseScriptPaths, rel) && !strings.Contains(text, "set -euo pipefail") {
 			t.Errorf("%s must enable set -euo pipefail", rel)
 		}
-		cmd := exec.Command("bash", "-n", abs)
+		cmd := newCleanBashCmd("bash", "-n", abs)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("bash -n %s failed: %v\n%s", rel, err, out)
 		}
@@ -5996,7 +5996,7 @@ func TestReleaseScriptsBaseline(t *testing.T) {
 		t.Fatalf("could not locate check_referrers_filters_applied awk program in %s", releaseCommonScriptPath)
 	}
 	commonAbs := filepath.Join(root, filepath.FromSlash(releaseCommonScriptPath))
-	if out, err := exec.Command("bash", "-c", `source "$1" || exit 2; if extract_final_http_headers "$2" >/dev/null 2>&1; then exit 1; fi`, "bash", commonAbs, filepath.Join(t.TempDir(), "missing.hdr")).CombinedOutput(); err != nil {
+	if out, err := newCleanBashCmd("bash", "-c", `source "$1" || exit 2; if extract_final_http_headers "$2" >/dev/null 2>&1; then exit 1; fi`, "bash", commonAbs, filepath.Join(t.TempDir(), "missing.hdr")).CombinedOutput(); err != nil {
 		t.Fatalf("extract_final_http_headers failed open on unreadable header file: err=%v out=%s", err, string(out))
 	}
 	wantDigest := "sha256:" + strings.Repeat("a", 64)
@@ -11225,7 +11225,7 @@ func TestWalkAwkTokensAndBashScanState(t *testing.T) {
 		})
 
 		if info, statErr := os.Stat("/bin/bash"); statErr == nil && info.Mode()&0o111 != 0 {
-			out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", strings.Join([]string{
+			out, bashErr := newCleanBashCmd("/bin/bash", "-euo", "pipefail", "-c", strings.Join([]string{
 				`x_p=''`,
 				`cat <<EOF`,
 				`'$(echo P_SQ_EXPANDS) # $'`,
@@ -21849,6 +21849,24 @@ func TestBoundedAwkWindowsMasksLiteralsAndRegexes(t *testing.T) {
 	}
 }
 
+func cleanBashEnv(extra ...string) []string {
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LC_ALL=C",
+		"LANG=C",
+	}
+	if tmpdir := os.Getenv("TMPDIR"); tmpdir != "" {
+		env = append(env, "TMPDIR="+tmpdir)
+	}
+	return append(env, extra...)
+}
+
+func newCleanBashCmd(bashBin string, args ...string) *exec.Cmd {
+	cmd := exec.Command(bashBin, args...)
+	cmd.Env = cleanBashEnv()
+	return cmd
+}
+
 func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 	t.Run("incremental continuation parity edge cases", func(t *testing.T) {
 		for _, tc := range []struct {
@@ -21991,7 +22009,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 
 		if bashBin, err := exec.LookPath("bash"); err == nil {
 			repro := "x=`echo 1\necho 2`\\\n; cat <<'EOF'\n\"\nEOF\nset +e\nfalse\necho BYPASSED"
-			out, runErr := exec.Command(bashBin, "-ec", repro).CombinedOutput()
+			out, runErr := newCleanBashCmd(bashBin, "-ec", repro).CombinedOutput()
 			if runErr != nil || !strings.Contains(string(out), "BYPASSED") {
 				t.Fatalf("bash -ec reproducer = (%q, %v), want BYPASSED output", out, runErr)
 			}
@@ -24889,9 +24907,11 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		if runtime.GOOS != "windows" {
 			if foundBin, err := exec.LookPath("bash"); err == nil {
 				bashBin = foundBin
-				if verOut, verErr := exec.Command(bashBin, "--noprofile", "--norc", "-c", `printf '%s.%s' "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}"`).Output(); verErr == nil {
-					bashMajor, bashMinor, bashHasVer = parseBashMajorMinor(string(verOut))
+				verOut, verErr := newCleanBashCmd(bashBin, "--noprofile", "--norc", "-c", `printf '%s.%s' "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}"`).Output()
+				if verErr != nil {
+					t.Fatalf("failed to query bash version from %s: %v", bashBin, verErr)
 				}
+				bashMajor, bashMinor, bashHasVer = parseBashMajorMinor(string(verOut))
 				if !bashVersionAtLeastPair(bashMajor, bashMinor, 3, 2, bashHasVer) || bashVersionAtLeastPair(bashMajor, bashMinor, 99, 0, bashHasVer) {
 					t.Fatalf("unexpected bash version gate sanity result for %s (%d.%d, parsed=%v)", bashBin, bashMajor, bashMinor, bashHasVer)
 				}
@@ -24913,6 +24933,8 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{ver: "4.4", wantMaj: 4, wantMin: 4, wantOK: true, wantPass: true},
 			{ver: "5.1", wantMaj: 5, wantMin: 2, wantOK: true, wantPass: false},
 			{ver: "5.2", wantMaj: 5, wantMin: 2, wantOK: true, wantPass: true},
+			{ver: "5.2", wantMaj: 5, wantMin: 3, wantOK: true, wantPass: false},
+			{ver: "5.3", wantMaj: 5, wantMin: 3, wantOK: true, wantPass: true},
 			{ver: "bad", wantMaj: 3, wantMin: 2, wantOK: false, wantPass: false},
 		} {
 			maj, minorVer, ok := parseBashMajorMinor(gateTC.ver)
@@ -24924,18 +24946,22 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 
 		type bashFeature string
 		const (
-			bashFeatProcSubstHeredoc              bashFeature = "proc_subst_heredoc"
-			bashFeatCoproc                        bashFeature = "coproc"
-			bashFeatBangTimeForArith              bashFeature = "bang_time_for_arith"
-			bashFeatQuotedArithOperand            bashFeature = "quoted_arith_operand"
-			bashFeatDoubleQuotedDollarSingleBrace bashFeature = "dq_dollar_single_brace"
-			bashFeatArithParamBareLBrace          bashFeature = "arith_param_bare_lbrace"
-			bashFeatDparenBareLBraceDowngrade     bashFeature = "dparen_bare_lbrace_downgrade"
-			bashFeatDparenSplitParenDowngrade     bashFeature = "dparen_split_paren_downgrade"
-			bashFeatDparenParamSplitRparen        bashFeature = "dparen_param_split_rparen"
-			bashFeatDparenParamHashSplitRparen    bashFeature = "dparen_param_hash_split_rparen"
-			bashFeatCmdSubstSplitDoubleRparen     bashFeature = "cmdsubst_split_double_rparen"
-			bashFeatCmdSubstSubshellParamParen    bashFeature = "cmdsubst_subshell_param_paren"
+			bashFeatProcSubstHeredoc               bashFeature = "proc_subst_heredoc"
+			bashFeatCoproc                         bashFeature = "coproc"
+			bashFeatBangTimeForArith               bashFeature = "bang_time_for_arith"
+			bashFeatArithCmdSubstQuotedCont        bashFeature = "arith_cmdsubst_quoted_cont"
+			bashFeatArithBareLBraceDoubleQuoted    bashFeature = "arith_bare_lbrace_dq"
+			bashFeatCmdSubstArithDoubleQuotedParen bashFeature = "cmdsubst_arith_dq_rparen"
+			bashFeatArithDoubleQuotedRparen        bashFeature = "arith_dq_rparen"
+			bashFeatArithDoubleQuotedDollarSingle  bashFeature = "arith_dq_dollar_single"
+			bashFeatDoubleQuotedDollarSingleBrace  bashFeature = "dq_dollar_single_brace"
+			bashFeatArithParamBareLBrace           bashFeature = "arith_param_bare_lbrace"
+			bashFeatDparenBareLBraceDowngrade      bashFeature = "dparen_bare_lbrace_downgrade"
+			bashFeatDparenSplitParenDowngrade      bashFeature = "dparen_split_paren_downgrade"
+			bashFeatDparenParamSplitRparen         bashFeature = "dparen_param_split_rparen"
+			bashFeatDparenParamHashSplitRparen     bashFeature = "dparen_param_hash_split_rparen"
+			bashFeatCmdSubstSplitDoubleRparen      bashFeature = "cmdsubst_split_double_rparen"
+			bashFeatCmdSubstSubshellParamParen     bashFeature = "cmdsubst_subshell_param_paren"
 		)
 		type bashProbeSpec struct {
 			syntaxOnly bool
@@ -24952,8 +24978,20 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				syntaxOnly: true,
 				script:     `! time -p for (( i=0; i<1; i++ )); do :; done`,
 			},
-			bashFeatQuotedArithOperand: {
-				script: `test "$(( "1" + 2 ))" = 3 && (( "1" ))`,
+			bashFeatArithCmdSubstQuotedCont: {
+				script: "seed=2; x=$(( ${seed:-0} \\\n + \"${seed:-0}\" \\\n + 1 )); test \"$x\" = 5",
+			},
+			bashFeatArithBareLBraceDoubleQuoted: {
+				script: `seed=1; (( "${seed:-{}" + (1 << 0) ))`,
+			},
+			bashFeatCmdSubstArithDoubleQuotedParen: {
+				script: `seed=1; x=$(( "${seed:-)}" + (1 << 0) )); test "$x" = 2`,
+			},
+			bashFeatArithDoubleQuotedRparen: {
+				script: `seed=1; (( "${seed:-)}" + (1 << 0) ))`,
+			},
+			bashFeatArithDoubleQuotedDollarSingle: {
+				script: `seed=1; (( "${seed:-$'1'}" + (1 << 0) ))`,
 			},
 			bashFeatDoubleQuotedDollarSingleBrace: {
 				script: `x=""; test "${x:-$'1}2'}" = "12}"`,
@@ -24962,59 +25000,93 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script: `seed=1; (( ${seed:-{} + (1 << 0) ))`,
 			},
 			bashFeatDparenBareLBraceDowngrade: {
-				script: "x=true; test \"$( (( ${x:-{1} ) && printf ok\n) )\" = ok",
+				script: "x=true; (( ${x:-{1} )\n)",
 			},
 			bashFeatDparenSplitParenDowngrade: {
 				script: "test \"$( (( printf ok )\\\n) 2>/dev/null )\" = ok && if false; then (( 1 <<EOF )\\\n)\nEOF\nfi",
 			},
 			bashFeatDparenParamSplitRparen: {
-				script: "x=echo; test \"$( (( ${x:-)\\\n)} ok\n)) )\" = ok",
+				script: "x=true; (( ${x:-)\\\n)}\n))",
 			},
 			bashFeatDparenParamHashSplitRparen: {
-				script: "x=echo; test \"$( (( ${x:-1 # )\\\n)} ok\n)) )\" = ok",
+				script: "x=true; (( ${x:-1 # )\\\n)}\n))",
 			},
 			bashFeatCmdSubstSplitDoubleRparen: {
-				script: "test \"$(( 1 + 2\n)\\\n)\" = 3 && if false; then x=$(( ${seed:-0\n)\\\n)\nfi",
+				syntaxOnly: true,
+				script:     "if false; then x=$(( ${seed:-0\n)\\\n)\nfi",
 			},
 			bashFeatCmdSubstSubshellParamParen: {
 				script: `test "$( ( true ) && echo ${y:-)} )" = ')' && test "$( ( true ) && echo ${y:-(} )" = '(' && if false; then (( $( ( true ) && echo ${y:-)} ) + (1 << 0) )); (( $( ( true ) && echo ${y:-(} ) + (1 << 0) )); fi`,
 			},
 		}
 
-		runBashProbe := func(syntaxOnly bool, script string) bool {
-			if bashBin == "" {
-				return false
+		runBashProbe := func(bin string, syntaxOnly bool, script string) (bool, error) {
+			if bin == "" {
+				return false, errors.New("bash probe called with empty bash binary")
 			}
 			args := []string{"--noprofile", "--norc"}
 			if syntaxOnly {
 				args = append(args, "-n", "-c", script)
-				out, err := exec.Command(bashBin, args...).CombinedOutput()
-				return err == nil && len(strings.TrimSpace(string(out))) == 0
+				out, err := newCleanBashCmd(bin, args...).CombinedOutput()
+				if err == nil {
+					return len(strings.TrimSpace(string(out))) == 0, nil
+				}
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					return false, fmt.Errorf("launch bash syntax probe %q: %w", bin, err)
+				}
+				if code := exitErr.ExitCode(); code != 1 && code != 2 {
+					return false, fmt.Errorf("unexpected bash syntax probe exit %d: %w (%s)", code, err, strings.TrimSpace(string(out)))
+				}
+				return false, nil
 			}
 			args = append(args, "-c", script)
-			return exec.Command(bashBin, args...).Run() == nil
+			err := newCleanBashCmd(bin, args...).Run()
+			if err == nil {
+				return true, nil
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				return false, fmt.Errorf("launch bash runtime probe %q: %w", bin, err)
+			}
+			if code := exitErr.ExitCode(); code != 1 && code != 2 {
+				return false, fmt.Errorf("unexpected bash runtime probe exit %d: %w", code, err)
+			}
+			return false, nil
 		}
-		featureProbeCache := make(map[bashFeature]bool, len(bashFeatureProbes))
-		bashSupportsFeature := func(feat bashFeature) bool {
-			if cached, ok := featureProbeCache[feat]; ok {
-				return cached
+		evalFeatureProbe := func(bin string, cache map[bashFeature]bool, feat bashFeature) (bool, error) {
+			if cached, ok := cache[feat]; ok {
+				return cached, nil
 			}
 			spec, ok := bashFeatureProbes[feat]
 			if !ok {
-				t.Fatalf("unknown bashFeature %q", feat)
+				return false, fmt.Errorf("unknown bashFeature %q", feat)
 			}
-			res := runBashProbe(spec.syntaxOnly, spec.script)
-			featureProbeCache[feat] = res
-			return res
+			res, err := runBashProbe(bin, spec.syntaxOnly, spec.script)
+			if err != nil {
+				return false, err
+			}
+			cache[feat] = res
+			return res, nil
+		}
+		evalSyntaxProbe := func(bin string, cache map[string]bool, probeScript string) (bool, error) {
+			if cached, ok := cache[probeScript]; ok {
+				return cached, nil
+			}
+			res, err := runBashProbe(bin, true, probeScript)
+			if err != nil {
+				return false, err
+			}
+			cache[probeScript] = res
+			return res, nil
+		}
+		featureProbeCache := make(map[bashFeature]bool, len(bashFeatureProbes))
+		bashSupportsFeature := func(feat bashFeature) (bool, error) {
+			return evalFeatureProbe(bashBin, featureProbeCache, feat)
 		}
 		syntaxProbeCache := make(map[string]bool)
-		bashSupportsSyntax := func(probeScript string) bool {
-			if cached, ok := syntaxProbeCache[probeScript]; ok {
-				return cached
-			}
-			res := runBashProbe(true, probeScript)
-			syntaxProbeCache[probeScript] = res
-			return res
+		bashSupportsSyntax := func(probeScript string) (bool, error) {
+			return evalSyntaxProbe(bashBin, syntaxProbeCache, probeScript)
 		}
 		funcHeaderProbe := func(header string) string {
 			return fmt.Sprintf("if false; then %s (( 1 )); %s ( : )\nfi", header, header)
@@ -25045,7 +25117,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:          "seed=2\nx=$(( ${seed:-0} \\\n  + \"${seed:-0}\" \\\n  + 1 ))\nprintf '%s' \"$x\"",
 				wantOut:         "5",
 				wantBashOK:      true,
-				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				reqBashFeatures: []bashFeature{bashFeatArithCmdSubstQuotedCont},
 				wantDisable:     false,
 				checkDisables:   true,
 			},
@@ -25103,7 +25175,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:          "seed=1\n(( \"${seed:-{}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_DQ_OK",
 				wantOut:         "BARE_DQ_OK",
 				wantBashOK:      true,
-				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				reqBashFeatures: []bashFeature{bashFeatArithBareLBraceDoubleQuoted},
 				wantDisable:     true,
 				checkDisables:   true,
 			},
@@ -25244,7 +25316,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:          "seed=1\nx=$(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
 				wantOut:         "2_OK",
 				wantBashOK:      true,
-				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				reqBashFeatures: []bashFeature{bashFeatCmdSubstArithDoubleQuotedParen},
 				wantDisable:     true,
 				checkDisables:   true,
 			},
@@ -25253,7 +25325,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:          "seed=1\n(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf DQ_RPAREN_OK",
 				wantOut:         "DQ_RPAREN_OK",
 				wantBashOK:      true,
-				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				reqBashFeatures: []bashFeature{bashFeatArithDoubleQuotedRparen},
 				wantDisable:     true,
 				checkDisables:   true,
 			},
@@ -25262,7 +25334,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:          "seed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '32_OK'",
 				wantOut:         "32_OK",
 				wantBashOK:      true,
-				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				reqBashFeatures: []bashFeature{bashFeatArithDoubleQuotedDollarSingle},
 				wantDisable:     true,
 				checkDisables:   true,
 			},
@@ -25271,7 +25343,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:          "x=\"\"\nprintf '<%s>' \"${x:-$'1}2'}\"\nseed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf ' OK'",
 				wantOut:         "<12}> OK",
 				wantBashOK:      true,
-				reqBashFeatures: []bashFeature{bashFeatDoubleQuotedDollarSingleBrace, bashFeatQuotedArithOperand},
+				reqBashFeatures: []bashFeature{bashFeatDoubleQuotedDollarSingleBrace, bashFeatArithDoubleQuotedDollarSingle},
 				wantDisable:     true,
 				checkDisables:   true,
 			},
@@ -26166,35 +26238,83 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			},
 		}
 
-		// Fail-closed sanity check for live bash capability probes + simulated Bash 3.2 coverage.
-		if bashBin != "" {
-			if bashSupportsSyntax("if false; then fi") {
-				t.Fatal("bashSupportsSyntax unexpectedly succeeded on invalid Bash syntax")
+		// Fail-closed sanity check for probe launch/unexpected errors, sanitized env,
+		// and simulated Bash 3.2 coverage.
+		t.Run("sanitized_env_and_probe_error_handling", func(t *testing.T) {
+			missingBin := filepath.Join(t.TempDir(), "missing-bash")
+			errFeatCache := make(map[bashFeature]bool)
+			if ok, err := evalFeatureProbe(missingBin, errFeatCache, bashFeatCoproc); err == nil || ok {
+				t.Fatalf("evalFeatureProbe(missingBin) = (%v, %v), want (false, non-nil error)", ok, err)
 			}
-			if bashSupportsSyntax(redirArrShiftProbe("<(printf 1)")) {
-				t.Fatal("redirArrShiftProbe unexpectedly succeeded for command-position process substitution")
+			if len(errFeatCache) != 0 {
+				t.Fatalf("evalFeatureProbe cached inconclusive launch error: %v", errFeatCache)
 			}
-			if bashSupportsSyntax(redirArrShiftProbe(`echo >"out"`)) {
-				t.Fatal("redirArrShiftProbe unexpectedly succeeded after non-assignment echo command")
+			errSynCache := make(map[string]bool)
+			if ok, err := evalSyntaxProbe(missingBin, errSynCache, "true"); err == nil || ok {
+				t.Fatalf("evalSyntaxProbe(missingBin) = (%v, %v), want (false, non-nil error)", ok, err)
 			}
-			if runBashProbe(false, `[ "$(LC_ALL=C type -t no_such_bash_kw_xyz)" = keyword ]`) {
-				t.Fatal("runtime keyword probe unexpectedly succeeded for missing keyword")
+			if len(errSynCache) != 0 {
+				t.Fatalf("evalSyntaxProbe cached inconclusive launch error: %v", errSynCache)
 			}
-		}
+
+			if bashBin == "" {
+				return
+			}
+			if ok, err := evalSyntaxProbe(bashBin, make(map[string]bool), "if false; then fi"); err != nil || ok {
+				t.Fatalf("evalSyntaxProbe(invalid) = (%v, %v), want (false, nil)", ok, err)
+			}
+			if ok, err := runBashProbe(bashBin, false, "false"); err != nil || ok {
+				t.Fatalf("runBashProbe(false) = (%v, %v), want (false, nil)", ok, err)
+			}
+			if ok, err := runBashProbe(bashBin, false, "nonexistent_probe_cmd_xyz_123"); err == nil || ok {
+				t.Fatalf("runBashProbe(exit 127) = (%v, %v), want (false, non-nil error)", ok, err)
+			}
+			if ok, err := bashSupportsSyntax(redirArrShiftProbe("<(printf 1)")); err != nil || ok {
+				t.Fatalf("redirArrShiftProbe(procSubst) = (%v, %v), want (false, nil)", ok, err)
+			}
+			if ok, err := bashSupportsSyntax(redirArrShiftProbe(`echo >"out"`)); err != nil || ok {
+				t.Fatalf("redirArrShiftProbe(echo) = (%v, %v), want (false, nil)", ok, err)
+			}
+			if ok, err := runBashProbe(bashBin, false, `[ "$(LC_ALL=C type -t no_such_bash_kw_xyz)" = keyword ]`); err != nil || ok {
+				t.Fatalf("runtime missing keyword probe = (%v, %v), want (false, nil)", ok, err)
+			}
+
+			poisonFile := filepath.Join(t.TempDir(), "poison.sh")
+			if err := os.WriteFile(poisonFile, []byte("echo POISON_BASH_ENV >&2\nexit 99\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("BASH_ENV", poisonFile)
+			t.Setenv("ENV", poisonFile)
+			t.Setenv("POSIXLY_CORRECT", "1")
+			t.Setenv("y", "POISON")
+			t.Setenv("seed", "POISON")
+			t.Setenv("x", "POISON")
+			out, envErr := newCleanBashCmd(bashBin, "--noprofile", "--norc", "-c", `printf '%s:%s:%s:%s' "${y:-clean}" "${seed:-clean}" "${POSIXLY_CORRECT:-clean}" "${BASH_ENV:-clean}"`).CombinedOutput()
+			if envErr != nil || string(out) != "clean:clean:clean:clean" {
+				t.Fatalf("newCleanBashCmd leaked caller environment: out=%q err=%v", out, envErr)
+			}
+			if ok, err := evalFeatureProbe(bashBin, make(map[bashFeature]bool), bashFeatCmdSubstSubshellParamParen); err != nil || !ok {
+				t.Fatalf("poisoned env flipped bashFeatCmdSubstSubshellParamParen: ok=%v err=%v", ok, err)
+			}
+		})
 
 		sim32Features := map[bashFeature]bool{
-			bashFeatProcSubstHeredoc:              true,
-			bashFeatArithParamBareLBrace:          true,
-			bashFeatCoproc:                        false,
-			bashFeatBangTimeForArith:              false,
-			bashFeatQuotedArithOperand:            false,
-			bashFeatDoubleQuotedDollarSingleBrace: false,
-			bashFeatDparenBareLBraceDowngrade:     false,
-			bashFeatDparenSplitParenDowngrade:     false,
-			bashFeatDparenParamSplitRparen:        false,
-			bashFeatDparenParamHashSplitRparen:    false,
-			bashFeatCmdSubstSplitDoubleRparen:     false,
-			bashFeatCmdSubstSubshellParamParen:    false,
+			bashFeatProcSubstHeredoc:               true,
+			bashFeatArithParamBareLBrace:           true,
+			bashFeatArithCmdSubstQuotedCont:        true,
+			bashFeatArithBareLBraceDoubleQuoted:    true,
+			bashFeatCmdSubstArithDoubleQuotedParen: true,
+			bashFeatArithDoubleQuotedRparen:        true,
+			bashFeatArithDoubleQuotedDollarSingle:  true,
+			bashFeatCoproc:                         false,
+			bashFeatBangTimeForArith:               false,
+			bashFeatDoubleQuotedDollarSingleBrace:  false,
+			bashFeatDparenBareLBraceDowngrade:      false,
+			bashFeatDparenSplitParenDowngrade:      false,
+			bashFeatDparenParamSplitRparen:         false,
+			bashFeatDparenParamHashSplitRparen:     false,
+			bashFeatCmdSubstSplitDoubleRparen:      false,
+			bashFeatCmdSubstSubshellParamParen:     false,
 		}
 		if len(sim32Features) != len(bashFeatureProbes) {
 			t.Fatalf("sim32Features covers %d features, want all %d bashFeatureProbes", len(sim32Features), len(bashFeatureProbes))
@@ -26227,7 +26347,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				sim32FeatureEligibleCount++
 			}
 		}
-		if sim32ScannerCount == 0 || sim32UngatedCount < 60 || sim32FeatureEligibleCount < 62 || sim32FeatureGatedCount < 35 || sim32SyntaxProbedCount < 35 {
+		if sim32ScannerCount == 0 || sim32UngatedCount < 60 || sim32FeatureEligibleCount < 67 || sim32FeatureGatedCount < 31 || sim32SyntaxProbedCount < 50 {
 			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: scanner=%d ungated=%d featEligible=%d featGated=%d syntaxProbed=%d",
 				sim32ScannerCount, sim32UngatedCount, sim32FeatureEligibleCount, sim32FeatureGatedCount, sim32SyntaxProbedCount)
 		}
@@ -26250,20 +26370,28 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 					return
 				}
 				for _, feat := range tc.reqBashFeatures {
-					if !bashSupportsFeature(feat) {
+					ok, err := bashSupportsFeature(feat)
+					if err != nil {
+						t.Fatalf("bash feature probe %s failed: %v", feat, err)
+					}
+					if !ok {
 						liveSkipped++
 						t.Logf("skipping live bash assertion on %s (%d.%d): unsupported feature %s", bashBin, bashMajor, bashMinor, feat)
 						return
 					}
 				}
 				for _, syn := range tc.reqBashSyntax {
-					if !bashSupportsSyntax(syn) {
+					ok, err := bashSupportsSyntax(syn)
+					if err != nil {
+						t.Fatalf("bash syntax probe %q failed: %v", syn, err)
+					}
+					if !ok {
 						liveSkipped++
 						t.Logf("skipping live bash assertion on %s (%d.%d): unsupported syntax probe %q", bashBin, bashMajor, bashMinor, syn)
 						return
 					}
 				}
-				out, runErr := exec.Command(bashBin, "--noprofile", "--norc", "-e", "-c", tc.script).CombinedOutput()
+				out, runErr := newCleanBashCmd(bashBin, "--noprofile", "--norc", "-e", "-c", tc.script).CombinedOutput()
 				if tc.wantBashOK {
 					if runErr != nil {
 						t.Fatalf("bash failed unexpectedly: %v\n%s", runErr, out)
@@ -26276,14 +26404,18 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				}
 			})
 		}
-		if bashBin != "" && bashVersionAtLeastPair(bashMajor, bashMinor, 5, 2, bashHasVer) {
+		if bashBin != "" && bashVersionAtLeastPair(bashMajor, bashMinor, 5, 3, bashHasVer) {
 			for feat := range bashFeatureProbes {
-				if !bashSupportsFeature(feat) {
-					t.Fatalf("bash %s (%d.%d) >= 5.2 unexpectedly failed feature probe %s", bashBin, bashMajor, bashMinor, feat)
+				ok, err := bashSupportsFeature(feat)
+				if err != nil {
+					t.Fatalf("bash %s (%d.%d) >= 5.3 feature probe %s errored: %v", bashBin, bashMajor, bashMinor, feat, err)
+				}
+				if !ok {
+					t.Fatalf("bash %s (%d.%d) >= 5.3 unexpectedly failed feature probe %s", bashBin, bashMajor, bashMinor, feat)
 				}
 			}
 			if liveSkipped != 0 {
-				t.Fatalf("bash %s (%d.%d) >= 5.2 skipped %d live parity cases, want 0", bashBin, bashMajor, bashMinor, liveSkipped)
+				t.Fatalf("bash %s (%d.%d) >= 5.3 skipped %d live parity cases, want 0", bashBin, bashMajor, bashMinor, liveSkipped)
 			}
 		}
 	})
