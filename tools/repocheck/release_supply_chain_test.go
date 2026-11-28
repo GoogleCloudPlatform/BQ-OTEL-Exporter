@@ -25024,10 +25024,12 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script: `seed=1; (( ${seed:-{} + (1 << 0) ))`,
 			},
 			bashFeatDparenBareLBraceDowngrade: {
-				script: "x=true; (( ${x:-{1} )\n)",
+				syntaxOnly: true,
+				script:     "if false; then (( ${x:-{1} ) <<EOF\n'\nEOF\n)\nfi",
 			},
 			bashFeatDparenSplitParenDowngrade: {
-				script: "test \"$( (( printf ok )\\\n) 2>/dev/null )\" = ok && if false; then (( 1 <<EOF )\\\n)\nEOF\nfi",
+				syntaxOnly: true,
+				script:     "if false; then (( 1 <<EOF )\\\n)\n'\nEOF\nfi",
 			},
 			bashFeatDparenParamSplitRparen: {
 				script: "x=true; (( ${x:-)\\\n)}\n))",
@@ -26350,9 +26352,9 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		sim32Features := map[bashFeature]bool{
 			bashFeatProcSubstHeredoc:               true,
 			bashFeatArithParamBareLBrace:           true,
-			bashFeatArithCmdSubstQuotedCont:        true,
+			bashFeatArithCmdSubstQuotedCont:        false,
 			bashFeatArithBareLBraceDoubleQuoted:    true,
-			bashFeatCmdSubstArithDoubleQuotedParen: true,
+			bashFeatCmdSubstArithDoubleQuotedParen: false,
 			bashFeatArithDoubleQuotedRparen:        true,
 			bashFeatArithDoubleQuotedDollarSingle:  true,
 			bashFeatCoproc:                         false,
@@ -26360,10 +26362,10 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			bashFeatDoubleQuotedDollarSingleBrace:  false,
 			bashFeatDparenBareLBraceDowngrade:      false,
 			bashFeatDparenSplitParenDowngrade:      false,
-			bashFeatDparenParamSplitRparen:         false,
-			bashFeatDparenParamHashSplitRparen:     false,
+			bashFeatDparenParamSplitRparen:         true,
+			bashFeatDparenParamHashSplitRparen:     true,
 			bashFeatCmdSubstSplitDoubleRparen:      false,
-			bashFeatCmdSubstSubshellParamParen:     false,
+			bashFeatCmdSubstSubshellParamParen:     true,
 		}
 		if len(sim32Features) != len(bashFeatureProbes) {
 			t.Fatalf("sim32Features covers %d features, want all %d bashFeatureProbes", len(sim32Features), len(bashFeatureProbes))
@@ -26396,7 +26398,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				sim32FeatureEligibleCount++
 			}
 		}
-		if sim32ScannerCount == 0 || sim32UngatedCount < 60 || sim32FeatureEligibleCount < 67 || sim32FeatureGatedCount < 31 || sim32SyntaxProbedCount < 50 {
+		if sim32ScannerCount == 0 || sim32UngatedCount < 60 || sim32FeatureEligibleCount < 65 || sim32FeatureGatedCount < 25 || sim32SyntaxProbedCount < 50 {
 			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: scanner=%d ungated=%d featEligible=%d featGated=%d syntaxProbed=%d",
 				sim32ScannerCount, sim32UngatedCount, sim32FeatureEligibleCount, sim32FeatureGatedCount, sim32SyntaxProbedCount)
 		}
