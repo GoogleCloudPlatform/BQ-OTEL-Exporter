@@ -24965,7 +24965,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script: "x=true; test \"$( (( ${x:-{1} ) && printf ok\n) )\" = ok",
 			},
 			bashFeatDparenSplitParenDowngrade: {
-				script: "test \"$( (( printf ok )\\\n) 2>/dev/null )\" = ok",
+				script: "test \"$( (( printf ok )\\\n) 2>/dev/null )\" = ok && if false; then (( 1 <<EOF )\\\n)\nEOF\nfi",
 			},
 			bashFeatDparenParamSplitRparen: {
 				script: "x=echo; test \"$( (( ${x:-)\\\n)} ok\n)) )\" = ok",
@@ -24974,7 +24974,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script: "x=echo; test \"$( (( ${x:-1 # )\\\n)} ok\n)) )\" = ok",
 			},
 			bashFeatCmdSubstSplitDoubleRparen: {
-				script: "test \"$(( 1 + 2\n)\\\n)\" = 3",
+				script: "test \"$(( 1 + 2\n)\\\n)\" = 3 && if false; then x=$(( ${seed:-0\n)\\\n)\nfi",
 			},
 			bashFeatCmdSubstSubshellParamParen: {
 				script: `test "$( ( true ) && echo ${y:-)} )" = ')' && test "$( ( true ) && echo ${y:-(} )" = '(' && if false; then (( $( ( true ) && echo ${y:-)} ) + (1 << 0) )); (( $( ( true ) && echo ${y:-(} ) + (1 << 0) )); fi`,
@@ -24987,7 +24987,9 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			}
 			args := []string{"--noprofile", "--norc"}
 			if syntaxOnly {
-				args = append(args, "-n")
+				args = append(args, "-n", "-c", script)
+				out, err := exec.Command(bashBin, args...).CombinedOutput()
+				return err == nil && len(strings.TrimSpace(string(out))) == 0
 			}
 			args = append(args, "-c", script)
 			return exec.Command(bashBin, args...).Run() == nil
@@ -25015,16 +25017,16 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			return res
 		}
 		funcHeaderProbe := func(header string) string {
-			return fmt.Sprintf("if false; then %s (( 1 )); %s ( : ); fi", header, header)
+			return fmt.Sprintf("if false; then %s (( 1 )); %s ( : )\nfi", header, header)
 		}
 		funcAttachedProbe := func(header string) string {
-			return fmt.Sprintf("if false; then %s(( 1 )); %s( : ); fi", header, header)
+			return fmt.Sprintf("if false; then %s(( 1 )); %s( : )\nfi", header, header)
 		}
 		funcKeywordIfProbe := func(header string) string {
-			return fmt.Sprintf("if false; then %s if (( 1 )); then :; fi; %s if ( : ); then :; fi; fi", header, header)
+			return fmt.Sprintf("if false; then %s if (( 1 )); then :; fi; %s if ( : ); then :; fi\nfi", header, header)
 		}
 		redirArrShiftProbe := func(redir string) string {
-			return fmt.Sprintf("if false; then %s arr[ 1 << 2 ]=x; fi", redir)
+			return fmt.Sprintf("if false; then %s arr[ 1 << 2 ]=x\nfi", redir)
 		}
 
 		type bashParityCase struct {
@@ -25652,7 +25654,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantDisable:     true,
 				checkDisables:   true,
 				reqBashFeatures: []bashFeature{bashFeatCoproc},
-				reqBashSyntax:   []string{`if false; then coproc my-co for (( i=0; i<1; i++ )); do :; done; fi`},
+				reqBashSyntax:   []string{"if false; then coproc my-co for (( i=0; i<1; i++ )); do :; done\nfi"},
 			},
 			{
 				name:          "prefix_function_reserved_if_dparen",
@@ -26169,6 +26171,12 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			if bashSupportsSyntax("if false; then fi") {
 				t.Fatal("bashSupportsSyntax unexpectedly succeeded on invalid Bash syntax")
 			}
+			if bashSupportsSyntax(redirArrShiftProbe("<(printf 1)")) {
+				t.Fatal("redirArrShiftProbe unexpectedly succeeded for command-position process substitution")
+			}
+			if bashSupportsSyntax(redirArrShiftProbe(`echo >"out"`)) {
+				t.Fatal("redirArrShiftProbe unexpectedly succeeded after non-assignment echo command")
+			}
 			if runBashProbe(false, `[ "$(LC_ALL=C type -t no_such_bash_kw_xyz)" = keyword ]`) {
 				t.Fatal("runtime keyword probe unexpectedly succeeded for missing keyword")
 			}
@@ -26181,27 +26189,47 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			bashFeatBangTimeForArith:              false,
 			bashFeatQuotedArithOperand:            false,
 			bashFeatDoubleQuotedDollarSingleBrace: false,
+			bashFeatDparenBareLBraceDowngrade:     false,
+			bashFeatDparenSplitParenDowngrade:     false,
+			bashFeatDparenParamSplitRparen:        false,
+			bashFeatDparenParamHashSplitRparen:    false,
+			bashFeatCmdSubstSplitDoubleRparen:     false,
+			bashFeatCmdSubstSubshellParamParen:    false,
 		}
-		var sim32ScannerCount, sim32LiveCount, sim32GatedCount int
+		if len(sim32Features) != len(bashFeatureProbes) {
+			t.Fatalf("sim32Features covers %d features, want all %d bashFeatureProbes", len(sim32Features), len(bashFeatureProbes))
+		}
+		var sim32ScannerCount, sim32UngatedCount, sim32FeatureEligibleCount, sim32FeatureGatedCount, sim32SyntaxProbedCount int
 		for _, tc := range parityCases {
 			if tc.checkDisables || tc.wantBashOK {
 				sim32ScannerCount++
 			}
-			enabled := true
+			if len(tc.reqBashFeatures) == 0 && len(tc.reqBashSyntax) == 0 {
+				sim32UngatedCount++
+			}
+			if len(tc.reqBashSyntax) > 0 {
+				sim32SyntaxProbedCount++
+			}
+			featOK := true
 			for _, feat := range tc.reqBashFeatures {
-				if !sim32Features[feat] {
-					enabled = false
+				enabled, known := sim32Features[feat]
+				if !known {
+					t.Fatalf("feature %q missing from sim32Features", feat)
+				}
+				if !enabled {
+					featOK = false
 					break
 				}
 			}
-			if enabled {
-				sim32LiveCount++
-			} else {
-				sim32GatedCount++
+			if !featOK {
+				sim32FeatureGatedCount++
+			} else if len(tc.reqBashSyntax) == 0 {
+				sim32FeatureEligibleCount++
 			}
 		}
-		if sim32ScannerCount == 0 || sim32LiveCount < 62 || sim32GatedCount < 28 {
-			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: scanner=%d live32=%d gated=%d", sim32ScannerCount, sim32LiveCount, sim32GatedCount)
+		if sim32ScannerCount == 0 || sim32UngatedCount < 60 || sim32FeatureEligibleCount < 62 || sim32FeatureGatedCount < 35 || sim32SyntaxProbedCount < 35 {
+			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: scanner=%d ungated=%d featEligible=%d featGated=%d syntaxProbed=%d",
+				sim32ScannerCount, sim32UngatedCount, sim32FeatureEligibleCount, sim32FeatureGatedCount, sim32SyntaxProbedCount)
 		}
 
 		var liveSkipped int

@@ -3836,6 +3836,21 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 		}
 	}
 
+	resolveBuildCheckoutAnchor := func(t *testing.T, workflowYAML string) string {
+		t.Helper()
+		doc := parseWorkflowYAMLNode(t, workflowYAML)
+		jobs := yamlMustMapValue(t, doc.Content[0], "jobs")
+		buildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, jobs, "build"))
+		return resolveYAMLAliasReadOnly(buildCheckout).Anchor
+	}
+
+	distinctFallbackAnchor := func(existingAnchor string) string {
+		if existingAnchor == "existing_shared_checkout" {
+			return "other_shared_checkout"
+		}
+		return "existing_shared_checkout"
+	}
+
 	buildAndLintSharedCheckoutYAMLFrom := func(t *testing.T, srcYAML, fallbackAnchor string) string {
 		t.Helper()
 		doc := parseWorkflowYAMLNode(t, srcYAML)
@@ -3905,12 +3920,13 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 
 		t.Run("preserves pre-anchored input workflow regardless of builder fallback", func(t *testing.T) {
 			preAnchoredYAML := buildAndLintSharedCheckoutYAML(t, "checkout")
-			rebuilt := buildAndLintSharedCheckoutYAMLFrom(t, preAnchoredYAML, "existing_shared_checkout")
-			rebuiltDoc := parseWorkflowYAMLNode(t, rebuilt)
-			rebuiltJobs := yamlMustMapValue(t, rebuiltDoc.Content[0], "jobs")
-			rebuiltBuildCheckout, _ := findNamedStepsInJob(t, yamlMustMapValue(t, rebuiltJobs, "build"))
-			if got := resolveYAMLAliasReadOnly(rebuiltBuildCheckout).Anchor; got != "checkout" {
-				t.Fatalf("builder overwrote pre-existing checkout anchor to %q, want %q", got, "checkout")
+			preAnchor := resolveBuildCheckoutAnchor(t, preAnchoredYAML)
+			if preAnchor == "" {
+				t.Fatal("test setup error: preAnchoredYAML build checkout step missing anchor")
+			}
+			rebuilt := buildAndLintSharedCheckoutYAMLFrom(t, preAnchoredYAML, distinctFallbackAnchor(preAnchor))
+			if got := resolveBuildCheckoutAnchor(t, rebuilt); got != preAnchor {
+				t.Fatalf("builder overwrote pre-existing checkout anchor to %q, want %q", got, preAnchor)
 			}
 			runPreservedSharedCheckoutCase(t, rebuilt)
 		})
@@ -4228,7 +4244,11 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 
 			runDetachmentWithSharedBuildLintFrom(t, ci, "existing_shared_checkout", "")
 			preAnchoredYAML := buildAndLintSharedCheckoutYAML(t, "checkout")
-			runDetachmentWithSharedBuildLintFrom(t, preAnchoredYAML, "existing_shared_checkout", "checkout")
+			preAnchor := resolveBuildCheckoutAnchor(t, preAnchoredYAML)
+			if preAnchor == "" {
+				t.Fatal("test setup error: preAnchoredYAML build checkout step missing anchor")
+			}
+			runDetachmentWithSharedBuildLintFrom(t, preAnchoredYAML, distinctFallbackAnchor(preAnchor), preAnchor)
 		})
 	})
 }
