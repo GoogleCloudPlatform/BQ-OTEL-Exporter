@@ -18309,13 +18309,14 @@ type bashLineIndex struct {
 	starts               []int
 	inline               [1]string
 	onePos               [1]int
+	builds               int
 	arithMemo            map[uint64]int8
 	failedDoubleParen    map[uint64]bool
 	failedForDoubleParen map[uint64]bool
 }
 
 func newBashLineIndex(src string) *bashLineIndex {
-	idx := &bashLineIndex{}
+	idx := &bashLineIndex{builds: 1}
 	if strings.IndexByte(src, '\n') < 0 {
 		idx.inline[0] = src
 		idx.lines = idx.inline[:]
@@ -18357,12 +18358,30 @@ func (idx *bashLineIndex) posToLineCol(pos int) (lineIdx, col int) {
 	return lo, pos - idx.starts[lo]
 }
 
+func ensureBashLineIndex(src string, cache **bashLineIndex, builds *int) *bashLineIndex {
+	if cache != nil && *cache != nil {
+		return *cache
+	}
+	idx := newBashLineIndex(src)
+	if builds != nil {
+		*builds++
+	}
+	if cache != nil {
+		*cache = idx
+	}
+	if idx.arithMemo == nil {
+		idx.arithMemo = make(map[uint64]int8)
+	}
+	return idx
+}
+
 type bashParamScanOpts struct {
 	allowSingleInDouble    bool
 	sawSingleInDoubleParam *bool
 	sawUnclosed            *bool
 	dropUnclosedOnEOF      bool
 	lineCache              **bashLineIndex
+	lineIndexBuilds        *int
 }
 
 func (o *bashParamScanOpts) ensureLineCache() **bashLineIndex {
@@ -18395,7 +18414,7 @@ func scanBashDoubleQuoteWithOpts(src string, openIdx int, opts bashParamScanOpts
 						return len(src) - 1, false
 					}
 				case '(':
-					endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
+					endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
 					if ok {
 						if onCmdSubst != nil {
 							onCmdSubst(inner)
@@ -18473,7 +18492,7 @@ func scanBashParamExpansionWithOpts(src string, dollarIdx int, inOuterDouble boo
 						return len(src) - 1, false
 					}
 				case '(':
-					endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
+					endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam)
 					if ok {
 						if onCmdSubst != nil {
 							onCmdSubst(inner)
@@ -18495,20 +18514,12 @@ func scanBashParamExpansionWithOpts(src string, dollarIdx int, inOuterDouble boo
 }
 
 func scanBashCmdSubstWithCache(src string, cache **bashLineIndex, dollarIdx int, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, ok bool) {
+	return scanBashCmdSubstWithCacheBuilds(src, cache, nil, dollarIdx, allowSingleInDouble, sawSingleInDoubleParam)
+}
+
+func scanBashCmdSubstWithCacheBuilds(src string, cache **bashLineIndex, builds *int, dollarIdx int, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, ok bool) {
 	isProcSubst := strings.HasPrefix(src[dollarIdx:], "<(") || strings.HasPrefix(src[dollarIdx:], ">(")
-	var idx *bashLineIndex
-	if cache != nil {
-		idx = *cache
-	}
-	if idx == nil {
-		idx = newBashLineIndex(src)
-		if cache != nil {
-			*cache = idx
-		}
-	}
-	if idx.arithMemo == nil {
-		idx.arithMemo = make(map[uint64]int8)
-	}
+	idx := ensureBashLineIndex(src, cache, builds)
 	subLines := idx.lines
 	startLine, startCol0 := idx.posToLineCol(dollarIdx)
 	sub := &bashScanState{lines: subLines, ignoreHeredocs: true, allowSingleInDouble: allowSingleInDouble, arithMemo: idx.arithMemo}
@@ -18532,19 +18543,11 @@ func scanBashCmdSubstWithCache(src string, cache **bashLineIndex, dollarIdx int,
 }
 
 func scanBashDoubleParenWithCache(src string, cache **bashLineIndex, openIdx int, fromForArith, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, arithClosed, ok bool) {
-	var idx *bashLineIndex
-	if cache != nil {
-		idx = *cache
-	}
-	if idx == nil {
-		idx = newBashLineIndex(src)
-		if cache != nil {
-			*cache = idx
-		}
-	}
-	if idx.arithMemo == nil {
-		idx.arithMemo = make(map[uint64]int8)
-	}
+	return scanBashDoubleParenWithCacheBuilds(src, cache, nil, openIdx, fromForArith, allowSingleInDouble, sawSingleInDoubleParam)
+}
+
+func scanBashDoubleParenWithCacheBuilds(src string, cache **bashLineIndex, builds *int, openIdx int, fromForArith, allowSingleInDouble bool, sawSingleInDoubleParam *bool) (endIdx int, inner string, arithClosed, ok bool) {
+	idx := ensureBashLineIndex(src, cache, builds)
 	subLines := idx.lines
 	startLine, startCol0 := idx.posToLineCol(openIdx)
 	if startLine >= len(subLines) || startCol0+1 >= len(subLines[startLine]) {
@@ -19292,7 +19295,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 					i = endIdx
 					continue
 				case '(':
-					if endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.ensureLineCache(), i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+					if endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.ensureLineCache(), opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 						addNestedSrc(inner)
 						cur.WriteString(src[i : endIdx+1])
 						i = endIdx
@@ -19304,7 +19307,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 		case '(':
 			if i+1 < len(src) && src[i+1] == '(' {
 				if isPrefix, isForArith := isBashDoubleParenCmdPrefix(cur.String()); isPrefix {
-					if endIdx, inner, arithClosed, ok := scanBashDoubleParenWithCache(src, opts.ensureLineCache(), i, isForArith, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+					if endIdx, inner, arithClosed, ok := scanBashDoubleParenWithCacheBuilds(src, opts.ensureLineCache(), opts.lineIndexBuilds, i, isForArith, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 						flush()
 						if !arithClosed || strings.ContainsAny(inner, "$`") {
 							addNestedSrc(inner)
@@ -19359,7 +19362,7 @@ func splitBashStatementsForErrexitDepth(src string, depth int, opts bashParamSca
 			flush()
 		case '>', '<':
 			if i+1 < len(src) && src[i+1] == '(' {
-				if endIdx, inner, ok := scanBashCmdSubstWithCache(src, opts.ensureLineCache(), i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+				if endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(src, opts.ensureLineCache(), opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 					addNestedSrc(inner)
 					cur.WriteString(src[i : endIdx+1])
 					i = endIdx
@@ -19480,14 +19483,14 @@ func skipRawBashQuotedOrSubstWithOpts(raw string, i int, opts bashParamScanOpts)
 				endIdx, _ := scanBashParamExpansionWithOpts(raw, i, false, opts, nil, nil)
 				return endIdx
 			case '(':
-				if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+				if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(raw, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 					return endIdx
 				}
 			}
 		}
 	case '<', '>':
 		if i+1 < len(raw) && raw[i+1] == '(' {
-			if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
+			if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(raw, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, opts.sawSingleInDoubleParam); ok {
 				return endIdx
 			}
 		}
@@ -19577,7 +19580,10 @@ func formatBashBraceSeqElem(seq *bashBraceSeq, val int64) string {
 }
 
 func findExpandableBashBrace(raw string) (expandableBashBrace, bool) {
-	opts := bashParamScanOpts{allowSingleInDouble: true}
+	return findExpandableBashBraceWithOpts(raw, bashParamScanOpts{allowSingleInDouble: true})
+}
+
+func findExpandableBashBraceWithOpts(raw string, opts bashParamScanOpts) (expandableBashBrace, bool) {
 	opts.ensureLineCache()
 	for i := 0; i < len(raw); i++ {
 		if raw[i] != '{' {
@@ -19693,7 +19699,10 @@ func expandBashWordBraces(raw string, budget *int) (words []string, truncated bo
 }
 
 func splitRawBashWords(stmt string) []rawBashWord {
-	opts := bashParamScanOpts{allowSingleInDouble: true}
+	return splitRawBashWordsWithOpts(stmt, bashParamScanOpts{allowSingleInDouble: true})
+}
+
+func splitRawBashWordsWithOpts(stmt string, opts bashParamScanOpts) []rawBashWord {
 	opts.ensureLineCache()
 	var rawWords []rawBashWord
 	wordStart := -1
@@ -19752,7 +19761,7 @@ func splitRawBashWords(stmt string) []rawBashWord {
 				case '{':
 					i, _ = scanBashParamExpansionWithOpts(stmt, i, false, opts, nil, nil)
 				case '(':
-					if endIdx, _, ok := scanBashCmdSubstWithCache(stmt, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
+					if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(stmt, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, nil); ok {
 						i = endIdx
 					}
 				}
@@ -19765,7 +19774,7 @@ func splitRawBashWords(stmt string) []rawBashWord {
 				if wordStart < 0 {
 					wordStart = i
 				}
-				if endIdx, _, ok := scanBashCmdSubstWithCache(stmt, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
+				if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(stmt, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, nil); ok {
 					i = endIdx
 					continue
 				}
@@ -20091,6 +20100,10 @@ func isBashZeroWordParamExpansionDepth(expr string, depth int) bool {
 }
 
 func decodeBashWord(raw string) bashWord {
+	return decodeBashWordWithOpts(raw, bashParamScanOpts{allowSingleInDouble: true})
+}
+
+func decodeBashWordWithOpts(raw string, opts bashParamScanOpts) bashWord {
 	var w bashWord
 	isProcSubst := strings.HasPrefix(raw, "<(") || strings.HasPrefix(raw, ">(")
 	if !isProcSubst {
@@ -20113,7 +20126,6 @@ func decodeBashWord(raw string) bashWord {
 		}
 	}
 
-	opts := bashParamScanOpts{allowSingleInDouble: true}
 	opts.ensureLineCache()
 	var cur strings.Builder
 	var inSingle, inDouble, dqHasAt, dqHasLiteral, hasQuoteOrEsc, hasLiteral, hasSubst bool
@@ -20175,7 +20187,7 @@ func decodeBashWord(raw string) bashWord {
 						i = endIdx
 						continue
 					case '(':
-						if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
+						if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(raw, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, nil); ok {
 							cur.WriteString(raw[i : endIdx+1])
 							i = endIdx
 							continue
@@ -20241,7 +20253,7 @@ func decodeBashWord(raw string) bashWord {
 					i = endIdx
 					continue
 				case '(':
-					if endIdx, _, ok := scanBashCmdSubstWithCache(raw, opts.lineCache, i, opts.allowSingleInDouble, nil); ok {
+					if endIdx, _, ok := scanBashCmdSubstWithCacheBuilds(raw, opts.lineCache, opts.lineIndexBuilds, i, opts.allowSingleInDouble, nil); ok {
 						cur.WriteString(raw[i : endIdx+1])
 						hasSubst = true
 						i = endIdx
@@ -22455,6 +22467,89 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		pBoundHash := runBashScanPass([]string{"(( a \\", "# comment", "echo sub", ") )", "set +e"}, false, true)
 		if pBoundHash.unclosed || !pBoundHash.reachedTopLevelByLine[4] {
 			t.Fatalf("(( a \\\\\\n# comment unexpected state: unclosed=%v top=%v", pBoundHash.unclosed, pBoundHash.reachedTopLevelByLine)
+		}
+	})
+
+	t.Run("line_index_built_once_across_multiline_offsets", func(t *testing.T) {
+		const nOffsets = 1024
+
+		// 1. Direct scanBashCmdSubstWithCache over N multiline $(...) offsets builds the index once.
+		unit := "x=$(\n  echo 1\n)\n"
+		multiSrc := strings.Repeat(unit, nOffsets)
+		var csCache *bashLineIndex
+		var csBuilds int
+		for i := range nOffsets {
+			pos := i*len(unit) + 2
+			endIdx, inner, ok := scanBashCmdSubstWithCacheBuilds(multiSrc, &csCache, &csBuilds, pos, true, nil)
+			if !ok || endIdx != i*len(unit)+len(unit)-2 || !strings.Contains(inner, "echo 1") {
+				t.Fatalf("offset %d: got (%d, %q, %v)", i, endIdx, inner, ok)
+			}
+		}
+		if csBuilds != 1 || csCache == nil || csCache.builds != 1 || len(csCache.starts) != 3*nOffsets+1 {
+			t.Fatalf("scanBashCmdSubstWithCache builds = %d (cache=%v), want 1 build with %d line starts", csBuilds, csCache, 3*nOffsets+1)
+		}
+
+		// 2. Direct scanBashDoubleParenWithCache over N unclosed downgraded (( ) chains builds once.
+		dpUnit := "if false; then (( echo ok )\n"
+		dpSrc := strings.Repeat(dpUnit, nOffsets)
+		var dpCache *bashLineIndex
+		var dpBuilds int
+		for i := range nOffsets {
+			pos := i*len(dpUnit) + len("if false; then ")
+			if _, _, _, ok := scanBashDoubleParenWithCacheBuilds(dpSrc, &dpCache, &dpBuilds, pos, false, true, nil); ok {
+				t.Fatalf("unexpected closed (( at offset %d", i)
+			}
+		}
+		if dpBuilds != 1 || dpCache == nil || dpCache.builds != 1 {
+			t.Fatalf("scanBashDoubleParenWithCache builds = %d (cache=%v), want 1", dpBuilds, dpCache)
+		}
+
+		// 3. Statement splitting, raw word splitting, word decoding, and brace expansion build once per source.
+		stmtSrc := strings.Repeat("x=\"${VAR:-$(printf item)}\"\n", nOffsets)
+		var stmtCache *bashLineIndex
+		var stmtBuilds int
+		stmts, _ := splitBashStatementsForErrexitDepth(stmtSrc, 0, bashParamScanOpts{
+			allowSingleInDouble: true,
+			lineCache:           &stmtCache,
+			lineIndexBuilds:     &stmtBuilds,
+		})
+		if len(stmts) != 2*nOffsets || stmtBuilds != 1 || stmtCache == nil || stmtCache.builds != 1 {
+			t.Fatalf("splitBashStatementsForErrexitDepth len=%d builds=%d cache=%v, want %d stmts and 1 build", len(stmts), stmtBuilds, stmtCache, 2*nOffsets)
+		}
+
+		wordLine := "echo" + strings.Repeat(" $(printf 'a\nb')", nOffsets)
+		var wordCache *bashLineIndex
+		var wordBuilds int
+		words := splitRawBashWordsWithOpts(wordLine, bashParamScanOpts{
+			allowSingleInDouble: true,
+			lineCache:           &wordCache,
+			lineIndexBuilds:     &wordBuilds,
+		})
+		if len(words) != nOffsets+1 || wordBuilds != 1 || wordCache == nil || wordCache.builds != 1 {
+			t.Fatalf("splitRawBashWordsWithOpts len=%d builds=%d cache=%v, want %d words and 1 build", len(words), wordBuilds, wordCache, nOffsets+1)
+		}
+
+		quotedWord := `"` + strings.Repeat("$(printf item)\n", nOffsets) + `"`
+		var decCache *bashLineIndex
+		var decBuilds int
+		dw := decodeBashWordWithOpts(quotedWord, bashParamScanOpts{
+			allowSingleInDouble: true,
+			lineCache:           &decCache,
+			lineIndexBuilds:     &decBuilds,
+		})
+		if dw.text == "" || decBuilds != 1 || decCache == nil || decCache.builds != 1 {
+			t.Fatalf("decodeBashWordWithOpts builds=%d cache=%v textLen=%d, want 1 build", decBuilds, decCache, len(dw.text))
+		}
+
+		braceSrc := strings.Repeat("$(printf 'x\ny')", nOffsets) + "{a,b}"
+		var braceCache *bashLineIndex
+		var braceBuilds int
+		if brace, ok := findExpandableBashBraceWithOpts(braceSrc, bashParamScanOpts{
+			allowSingleInDouble: true,
+			lineCache:           &braceCache,
+			lineIndexBuilds:     &braceBuilds,
+		}); !ok || len(brace.commas) != 1 || braceBuilds != 1 || braceCache == nil || braceCache.builds != 1 {
+			t.Fatalf("findExpandableBashBraceWithOpts ok=%v builds=%d cache=%v, want ok=true and 1 build", ok, braceBuilds, braceCache)
 		}
 	})
 
@@ -24757,1118 +24852,1348 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			}
 		}
 
-		if runtime.GOOS != "windows" {
-			if bashBin, err := exec.LookPath("bash"); err == nil {
-				verOut, verErr := exec.Command(bashBin, "--noprofile", "--norc", "-c", `printf '%s.%s' "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}"`).Output()
-				var bashMajor, bashMinor int
-				var bashHasVer bool
-				if verErr == nil {
-					parts := strings.SplitN(strings.TrimSpace(string(verOut)), ".", 2)
-					if len(parts) == 2 {
-						major, err1 := strconv.Atoi(parts[0])
-						minor, err2 := strconv.Atoi(parts[1])
-						if err1 == nil && err2 == nil {
-							bashMajor, bashMinor = major, minor
-							bashHasVer = true
-						}
-					}
-				}
-				bashVersionAtLeast := func(wantMajor, wantMinor int) bool {
-					if !bashHasVer {
-						return false
-					}
-					return bashMajor > wantMajor || (bashMajor == wantMajor && bashMinor >= wantMinor)
-				}
-				if !bashVersionAtLeast(3, 2) || bashVersionAtLeast(99, 0) {
-					t.Fatalf("unexpected bash version gate sanity result for %s (%d.%d, parsed=%v)", bashBin, bashMajor, bashMinor, bashHasVer)
-				}
+		parseBashMajorMinor := func(ver string) (major, minor int, ok bool) {
+			parts := strings.SplitN(strings.TrimSpace(ver), ".", 2)
+			if len(parts) != 2 {
+				return 0, 0, false
+			}
+			maj, err1 := strconv.Atoi(parts[0])
+			minorVer, err2 := strconv.Atoi(parts[1])
+			if err1 != nil || err2 != nil || maj <= 0 || minorVer < 0 {
+				return 0, 0, false
+			}
+			return maj, minorVer, true
+		}
+		bashVersionAtLeastPair := func(haveMajor, haveMinor, wantMajor, wantMinor int, hasVer bool) bool {
+			if !hasVer {
+				return false
+			}
+			return haveMajor > wantMajor || (haveMajor == wantMajor && haveMinor >= wantMinor)
+		}
 
-				for _, tc := range []struct {
-					name          string
-					script        string
-					wantOut       string
-					wantBashOK    bool
-					minBashMajor  int
-					minBashMinor  int
-					wantDisable   bool
-					checkDisables bool
-				}{
-					{
-						name:       "arith_param_cont_evaluates",
-						script:     "seed=2\nx=$(( ${seed:-0} \\\n  + \"${seed:-0}\" \\\n  + 1 ))\nprintf '%s' \"$x\"",
-						wantOut:    "5",
-						wantBashOK: true,
-					},
-					{
-						name:       "cmd_arith_param_cont_evaluates",
-						script:     "(( ${seed:-0} \\\n  + ${other:-1} ))\nprintf ARITH_OK",
-						wantOut:    "ARITH_OK",
-						wantBashOK: true,
-					},
-					{
-						name:       "arith_param_length_nonboundary_hash",
-						script:     "arr=(1 2)\n(( ${#arr[@]} ))\nprintf LEN_OK",
-						wantOut:    "LEN_OK",
-						wantBashOK: true,
-					},
-					{
-						name:          "arith_param_hash_not_comment_single_line",
-						script:        "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF) ))\nset +e\nfalse\nprintf P1_1_SINGLE_OK",
-						wantOut:       "P1_1_SINGLE_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_hash_not_comment_multiline",
-						script:        "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF)\n))\nset +e\nfalse\nprintf P1_1_MULTI_OK",
-						wantOut:       "P1_1_MULTI_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_hash_balanced_paren_not_comment",
-						script:        "seed=1\n(( ${seed:-1 # (foo)} + (1 <<EOF)\n))\nset +e\nfalse\nprintf P1_1_BALANCED_OK",
-						wantOut:       "P1_1_BALANCED_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_bare_lbrace_unquoted",
-						script:        "seed=1\n(( ${seed:-{} + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_U_OK",
-						wantOut:       "BARE_U_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_bare_lbrace_double_quoted",
-						script:        "seed=1\n(( \"${seed:-{}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_DQ_OK",
-						wantOut:       "BARE_DQ_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_bare_lbrace_unmatched_rparen_downgrades",
-						script:        "seed='cat'\n(( ${seed:-{1} ) <<EOF\n'\nEOF\n)\nset +e\nfalse\nprintf BARE_RPAREN_OK",
-						wantOut:       "'\nBARE_RPAREN_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_hash_rparen_heredoc_bypass_downgrades",
-						script:        "seed='cat'\n(( ${seed:-1 # ) } <<EOF\n'\nEOF\n))\nset +e\nfalse\necho BYPASS_EXPLOIT_WORKS",
-						wantOut:       "'\nBYPASS_EXPLOIT_WORKS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_rparen_nohash_heredoc_bypass_downgrades",
-						script:        "seed='cat'\n(( ${seed:-)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho BYPASS_NOHASH_WORKS",
-						wantOut:       "'\nBYPASS_NOHASH_WORKS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_kgt0_adj_double_rparen_heredoc_bypass_downgrades",
-						script:        "seed='cat'\n(( ( ${seed:-))} <<EOF\n'\nEOF\n)))\nset +e\n: ')))' \\'\nfalse\necho CASE_A_OK",
-						wantOut:       "'\nCASE_A_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_k0_unsplit_double_rparen_if_false_bitshift_bypass",
-						script:        "EOF() { :; }\nif false; then\n  { (( (1 <<EOF) + ${seed:-));}\nfi\nset +e\nfalse\necho CASE_B_OK\nEOF",
-						wantOut:       "CASE_B_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_k0_unsplit_double_rparen_if_false_heredoc_bypass",
-						script:        "if false; then { (( ${seed:-)) ; }; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ATK1_J_UNSPLIT_BYPASS",
-						wantOut:       "'\nATK1_J_UNSPLIT_BYPASS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_k0_unsplit_double_rparen_shortcircuit_heredoc_bypass",
-						script:        "false && { (( ${seed:-)) ; }\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ATK1_K_SHORTCIRCUIT_BYPASS",
-						wantOut:       "'\nATK1_K_SHORTCIRCUIT_BYPASS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_k0_unclosed_nextline_double_rparen_closes",
-						script:        "if false; then (( ${seed:-0\n))\nfi\nset +e\nfalse\necho CASE_D_OK",
-						wantOut:       "CASE_D_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_split_double_rparen_heredoc_bypass_downgrades",
-						script:        "seed='cat'\n(( ${seed:-)\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_D",
-						wantOut:       "'\nATK1_D\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_split_double_rparen_hash_heredoc_bypass_downgrades",
-						script:        "seed='cat'\n(( ${seed:-1 # )\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_F",
-						wantOut:       "'\nATK1_F\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "cmdsubst_arith_param_unclosed_split_double_rparen_closes",
-						script:        "if false; then x=$(( ${seed:-0\n)\\\n)\nfi\nset +e\nfalse\necho COMSUB_SPLIT_OK",
-						wantOut:       "COMSUB_SPLIT_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "cmdsubst_arith_param_unsplit_double_rparen_closes",
-						script:        "if false; then x=$(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COMSUB_UNSPLIT_OK",
-						wantOut:       "'\nCOMSUB_UNSPLIT_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_plain_split_closing_parens_downgrades_to_subshell_heredoc",
-						script:        "(( cat <<EOF )\\\n)\n'\nEOF\nset +e\nfalse\necho DPAREN_SPLIT_CAT_OK",
-						wantOut:       "'\nDPAREN_SPLIT_CAT_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_plain_split_if_false_heredoc_swallows_set_e",
-						script:        "if false; then\n(( 1 <<EOF )\\\n)\nset +e\nEOF\nfi\nfalse\necho SHOULD_FAIL",
-						wantBashOK:    false,
-						wantDisable:   false,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_plain_unsplit_if_false_bitshift_runs_set_e",
-						script:        "EOF() { :; }\nif false; then\n(( 1 <<EOF ))\nfi\nset +e\nfalse\necho UNSPLIT_AFTER_OK\nEOF",
-						wantOut:       "UNSPLIT_AFTER_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "cmdsubst_arith_param_rparen_syntax_error",
-						script:        "seed='cat'\nx=$(( ${seed:-)} <<EOF\n'ok'\nEOF\n))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
-						wantBashOK:    false,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "cmdsubst_arith_param_double_quoted_rparen_ok",
-						script:        "seed=1\nx=$(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
-						wantOut:       "2_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_double_quoted_rparen_stays_arith",
-						script:        "seed=1\n(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf DQ_RPAREN_OK",
-						wantOut:       "DQ_RPAREN_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "arith_param_double_quoted_dollar_single_arith_invariant",
-						script:        "seed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '32_OK'",
-						wantOut:       "32_OK",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:         "arith_param_double_quoted_dollar_single_closes_first_brace",
-						script:       "x=\"\"\nprintf '<%s>' \"${x:-$'1}2'}\"\nseed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf ' OK'",
-						wantOut:      "<12}> OK",
-						wantBashOK:   true,
-						minBashMajor: 5,
-						minBashMinor: 2,
-					},
-					{
-						name:       "assign_proc_subst_input_allows_spaced_array",
-						script:     "v=<(printf 1) arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_output_allows_spaced_array",
-						script:     "v=>(true) arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_glued_word_allows_spaced_array",
-						script:     "v=pre<(printf 1)post arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_nested_allows_spaced_array",
-						script:     "v=<(echo <(printf 1)) arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_multiline_allows_spaced_array",
-						script:     "v=<(printf 1\n) arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_heredoc_allows_spaced_array",
-						script:     "v=<(cat <<INNER\nhi\nINNER\nprintf 2) arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_glued_echo_allows_spaced_array",
-						script:     "v=<(printf 1)echo arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "assign_proc_subst_glued_hash_allows_spaced_array",
-						script:     "v=<(printf 1)#tag arr[ 1 << 2 ]=x && printf REACHED",
-						wantOut:    "REACHED",
-						wantBashOK: true,
-					},
-					{
-						name:       "standalone_subshell_glued_hash_comments_rest_of_line",
-						script:     "(true)#tag && printf SHOULD_NOT_PRINT\nprintf DONE",
-						wantOut:    "DONE",
-						wantBashOK: true,
-					},
-					{
-						name:       "cmd_pos_proc_subst_fails_as_command",
-						script:     "<(printf 1) arr[ 1 << 2 ]=x",
-						wantBashOK: false,
-					},
-					{
-						name:       "after_prefix_assign_proc_subst_fails_as_command",
-						script:     "v=1 <(printf 1) arr[ 1 << 2 ]=x",
-						wantBashOK: false,
-					},
-					{
-						name:          "prefix_for_arith_param_adj_rparen",
-						script:        "if false; then for (( i=0; i<1; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho FOR_OK\n",
-						wantOut:       "FOR_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_coproc_arith_param_adj_rparen",
-						script:        "if false; then coproc (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_OK\n",
-						wantOut:       "'\nCOPROC_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_name_arith_param_adj_rparen",
-						script:        "if false; then coproc myco (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_NAME_OK\n",
-						wantOut:       "'\nCOPROC_NAME_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_time_arith_param_adj_rparen",
-						script:        "if false; then coproc time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_TIME_OK\n",
-						wantOut:       "'\nCOPROC_TIME_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_name_for_arith_param_adj_rparen",
-						script:        "if false; then coproc myco for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho COPROC_FOR_OK\n",
-						wantOut:       "COPROC_FOR_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_function_name_arith_param_adj_rparen",
-						script:        "if false; then function myfn (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_OK\n",
-						wantOut:       "'\nFN_KW_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_name_parens_arith_param_adj_rparen",
-						script:        "if false; then function myfn() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_PARENS_OK\n",
-						wantOut:       "'\nFN_KW_PARENS_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_name_parens_arith_param_adj_rparen",
-						script:        "if false; then myfn() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_PARENS_OK\n",
-						wantOut:       "'\nFN_PARENS_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_bang_time_p_for_arith_param_adj_rparen",
-						script:        "if false; then ! time -p for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho BANG_TIME_FOR_OK\n",
-						wantOut:       "BANG_TIME_FOR_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "downgraded_comsub_double_paren_unwinds_param_and_cmdsubst",
-						script:        "if false; then x=$(( true ) && echo ${y:-)} ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DG5_OK\n",
-						wantOut:       "'\nDG5_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_unwinds_param_and_keeps_bitshift",
-						script:        "if false; then (( $(( true ) && echo ${y:-)} + (1 <<EOF) )); fi\nset +e\nfalse\necho DG9_OK\n",
-						wantOut:       "DG9_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "unclosed_comsub_double_paren_adj_rparen_unwinds_outer_cmdsubst",
-						script:        "if false; then x=$(( ${y:-)} && echo ${z:-)} ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DG2_OK\n",
-						wantOut:       "'\nDG2_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "top_level_dparen_downgraded_comsub_param_rparen_ok",
-						script:        "{ (( $(( true ) && echo ${y:-)} + (1 <<EOF) )); } 2>/dev/null || true\nset +e\nfalse\necho EXEC5_OK\n",
-						wantOut:       "EXEC5_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "downgraded_comsub_subshell_param_rparen_ok",
-						script:        "if false; then x=$(( true ) && (echo ${y:-)} ); fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho EXEC6_OK\n",
-						wantOut:       "'\nEXEC6_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "multiline_downgraded_comsub_param_closes_on_rparen",
-						script:        "if false; then x=$(( true ) && echo ${y:-0\n)\nfi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho MULTILINE_DG_OK\n",
-						wantOut:       "'\nMULTILINE_DG_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "benign_coproc_closed_downgraded_dparen_keeps_heredoc_inert",
-						script:        "if false; then coproc myco (( ${seed:-)} )); fi\ncat <<EOF\nset +e\nEOF\necho SAFE\n",
-						wantOut:       "set +e\nSAFE\n",
-						wantBashOK:    true,
-						wantDisable:   false,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "for_arith_header_avoids_bogus_bitshift_heredoc",
-						script:        "if false; then\nfor (( ; # \\\n( \\\na)\n1 << 2\n; 0 ))\ndo\nset +e\n2\ndone\nfi\necho FOR_SHIFT_OK\n",
-						wantOut:       "FOR_SHIFT_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "single_comsub_subshell_keeps_iswordparen_true_on_rparen",
-						script:        "if false; then (( $( ( true ) && echo ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_OK\n",
-						wantOut:       "SUB_DG_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "single_comsub_subshell_keeps_iswordparen_true_on_lparen",
-						script:        "if false; then (( $( ( true ) && echo ${y:-(} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_LPAREN_OK\n",
-						wantOut:       "SUB_DG_LPAREN_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:       "dparen_downgraded_comsub_rparen_outside_param_syntax_error",
-						script:     "(( $(( true ) && echo ${y:-)} ) + (1 <<EOF) ))",
-						wantBashOK: false,
-					},
-					{
-						name:       "dparen_downgraded_comsub_lparen_outside_param_syntax_error",
-						script:     "(( $(( true ) && echo ${y:-(} ) + (1 <<EOF) ))",
-						wantBashOK: false,
-					},
-					{
-						name:          "downgraded_comsub_nested_subshell_preserves_param_expand",
-						script:        "if false; then x=$(( true ) && ( echo ${y:-1 ) <<EOF } ); fi\nset +e\nfalse\necho P1_HEREDOC\n",
-						wantOut:       "P1_HEREDOC\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "downgraded_comsub_synth_subshell_preserves_param_expand",
-						script:        "if false; then x=$(( true ) && ( echo ${a:-(} && echo ${b:-1 ) <<EOF } ) ); fi\nset +e\nfalse\necho P1_SYNTH_HEREDOC\n",
-						wantOut:       "P1_SYNTH_HEREDOC\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_nested_subshell_param_hash",
-						script:        "if false; then (( $(( true ) && ( echo ${y:-1 ) # } ) + (1 <<EOF) )); fi\nset +e\nfalse\necho P1_HASH_A\n",
-						wantOut:       "P1_HASH_A\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_synth_subshell_param_hash",
-						script:        "if false; then (( $(( true ) && ( echo ${a:-(} && echo ${b:-1 ) # } ) ) + (1 <<EOF) )); fi\nset +e\nfalse\necho P1_HASH_B\n",
-						wantOut:       "P1_HASH_B\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_funcdef_parens_for_arith",
-						script:        "if false; then myfn() for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho FN_FOR\n",
-						wantOut:       "FN_FOR\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_keyword_if_dparen",
-						script:        "if false; then function myfn if (( ${seed:-)) ; then :; fi; fi\nset +e\nfalse\necho FNKW_IF\n",
-						wantOut:       "FNKW_IF\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_array_literal_param_rparen",
-						script:        "if false; then (( $(( true ) && a=( ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR1\n",
-						wantOut:       "ARR1\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_plus_array_literal_param_rparen",
-						script:        "if false; then (( $(( true ) && a+=( ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR2\n",
-						wantOut:       "ARR2\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_array_literal_nested_subshell",
-						script:        "if false; then (( $(( true ) && a=( ( echo ${y:-)} ) ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR_NS\n",
-						wantOut:       "ARR_NS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "dparen_downgraded_comsub_array_literal_dq_param_ok",
-						script:        "if false; then (( $(( true ) && a=( \"${y:-)}\" ) ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR_DQ_OK\n",
-						wantOut:       "ARR_DQ_OK\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:       "dparen_downgraded_comsub_array_literal_extra_rparen_syntax_error",
-						script:     "if false; then (( $(( true ) && a=( ${y:-)} ) ) + (1 <<EOF) )); fi",
-						wantBashOK: false,
-					},
-					{
-						name:          "prefix_coproc_hyphen_name_dparen",
-						script:        "if false; then coproc my-co (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_HYPH\n",
-						wantOut:       "'\nC_HYPH\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_dot_name_dparen",
-						script:        "if false; then coproc foo.bar (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DOT\n",
-						wantOut:       "'\nC_DOT\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_quoted_name_dparen",
-						script:        "if false; then coproc \"myco\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ\n",
-						wantOut:       "'\nC_DQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_hyphen_name_for_arith",
-						script:        "if false; then coproc my-co for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho C_HYPH_FOR\n",
-						wantOut:       "C_HYPH_FOR\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_function_reserved_if_dparen",
-						script:        "if false; then function if (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_IF\n",
-						wantOut:       "'\nFN_KW_IF\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_reserved_for_dparen",
-						script:        "if false; then function for (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_FOR\n",
-						wantOut:       "'\nFN_KW_FOR\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_reserved_time_dparen",
-						script:        "if false; then function time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_TIME\n",
-						wantOut:       "'\nFN_KW_TIME\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_reserved_fi_dparen",
-						script:        "if false; then function fi (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_FI\n",
-						wantOut:       "'\nFN_KW_FI\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_quoted_name_dparen",
-						script:        "if false; then function \"myfn\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_DQ\n",
-						wantOut:       "'\nFN_DQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_reserved_if_parens_dparen",
-						script:        "if false; then function if() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_IFP\n",
-						wantOut:       "'\nFN_IFP\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_quoted_funcdef_parens_dparen",
-						script:        "if false; then \"myfn\"() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DQ_P\n",
-						wantOut:       "'\nDQ_P\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_hyphen_funcdef_parens_dparen",
-						script:        "if false; then my-fn() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho HYPH_P\n",
-						wantOut:       "'\nHYPH_P\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:       "prefix_funcdef_parens_coproc_syntax_error",
-						script:     "if false; then myfn() coproc (( 1 )); fi",
-						wantBashOK: false,
-					},
-					{
-						name:       "prefix_coproc_two_words_syntax_error",
-						script:     "if false; then coproc \"myco\" foo (( 1 )); fi",
-						wantBashOK: false,
-					},
-					{
-						name:          "for_arith_inner_closed_by_param_rparen_keeps_outer_unclosed",
-						script:        "if false; then for (( ; for (( ;; ${seed:-)) ; do :; done; fi\nset +e\n",
-						wantBashOK:    false,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "for_arith_param_double_rparen_valid_bash",
-						script:        "if false; then for (( ;; ${seed:-)) ; do :; done; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FOR_VALID\n",
-						wantOut:       "'\nFOR_VALID\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_redir_dq_allows_arr_shift_assign",
-						script:        "if false; then >\"out\" arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_DQ\n",
-						wantOut:       "R_DQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_redir_sq_allows_arr_shift_assign",
-						script:        "if false; then >'out' arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_SQ\n",
-						wantOut:       "R_SQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_redir_dollar_allows_arr_shift_assign",
-						script:        "if false; then >$out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_VAR\n",
-						wantOut:       "R_VAR\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_redir_esc_allows_arr_shift_assign",
-						script:        "if false; then >\\out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_ESC\n",
-						wantOut:       "R_ESC\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_redir_backtick_allows_arr_shift_assign",
-						script:        "if false; then >`echo out` arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_BT\n",
-						wantOut:       "R_BT\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:       "prefix_redir_dq_parens_syntax_error",
-						script:     "if false; then >\"out\"() (( 1 )); fi",
-						wantBashOK: false,
-					},
-					{
-						name:          "prefix_function_param_default_dparen",
-						script:        "if false; then function ${name:-myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_DEF\n",
-						wantOut:       "'\nFN_P_DEF\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_param_assign_dparen",
-						script:        "if false; then function ${name:=myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_EQ\n",
-						wantOut:       "'\nFN_P_EQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_nested_param_dparen",
-						script:        "if false; then function ${a:-${b:-myfn}} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_NEST\n",
-						wantOut:       "'\nFN_P_NEST\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_arith_name_dparen",
-						script:        "if false; then function $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARITH\n",
-						wantOut:       "'\nFN_ARITH\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_param_parens_dparen",
-						script:        "if false; then ${name:-myfn}() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho P_PARENS\n",
-						wantOut:       "'\nP_PARENS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_arith_parens_dparen",
-						script:        "if false; then $((1+1))() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho A_PARENS\n",
-						wantOut:       "'\nA_PARENS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_coproc_param_assign_op_dparen",
-						script:        "if false; then coproc ${var:=myco} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_P_EQ\n",
-						wantOut:       "'\nC_P_EQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_dq_eq_dparen",
-						script:        "if false; then coproc \"a=b\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ_EQ\n",
-						wantOut:       "'\nC_DQ_EQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_esc_eq_dparen",
-						script:        "if false; then coproc a\\=b (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ESC_EQ\n",
-						wantOut:       "'\nC_ESC_EQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_arith_name_dparen",
-						script:        "if false; then coproc $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARITH\n",
-						wantOut:       "'\nC_ARITH\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:       "prefix_coproc_assign_word_syntax_error",
-						script:     "if false; then coproc a=1 (( 1 )); fi",
-						wantBashOK: false,
-					},
-					{
-						name:       "prefix_coproc_arr_assign_word_syntax_error",
-						script:     "if false; then coproc a[0]=1 (( 1 )); fi",
-						wantBashOK: false,
-					},
-					{
-						name:          "prefix_coproc_backtick_space_dparen",
-						script:        "if false; then coproc `echo myco` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_BT\n",
-						wantOut:       "'\nC_BT\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_function_backtick_space_dparen",
-						script:        "if false; then function `echo myfn` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_BT\n",
-						wantOut:       "'\nFN_BT\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_backtick_space_parens_dparen",
-						script:        "if false; then `echo myfn`() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho BT_P\n",
-						wantOut:       "'\nBT_P\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_coproc_subscript_a0_dparen",
-						script:        "if false; then coproc a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUB0\n",
-						wantOut:       "'\nC_SUB0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_subscript_shift_dparen",
-						script:        "if false; then coproc a[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBS\n",
-						wantOut:       "'\nC_SUBS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_subscript_quoted_eq_dparen",
-						script:        "if false; then coproc a[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBQ\n",
-						wantOut:       "'\nC_SUBQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_function_subscript_a0_dparen",
-						script:        "if false; then function a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_SUB0\n",
-						wantOut:       "'\nFN_SUB0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_subscript_shift_parens_dparen",
-						script:        "if false; then a[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho SUB_P\n",
-						wantOut:       "'\nSUB_P\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_coproc_multi_subscript_arr0_dparen",
-						script:        "if false; then coproc arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARR0\n",
-						wantOut:       "'\nC_ARR0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_multi_subscript_shift_dparen",
-						script:        "if false; then coproc arr[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRS\n",
-						wantOut:       "'\nC_ARRS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_coproc_multi_subscript_quoted_eq_dparen",
-						script:        "if false; then coproc arr[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRQ\n",
-						wantOut:       "'\nC_ARRQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:          "prefix_multi_subscript_shift_parens_dparen",
-						script:        "if false; then arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ARR_P\n",
-						wantOut:       "'\nARR_P\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_time_multi_subscript_shift_parens_dparen",
-						script:        "if false; then time arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho T_ARR_P\n",
-						wantOut:       "'\nT_ARR_P\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_function_multi_subscript_arr0_dparen",
-						script:        "if false; then function arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARR0\n",
-						wantOut:       "'\nFN_ARR0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_dq_dparen",
-						script:        "if false; then function \"myfn\"(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DQ\n",
-						wantOut:       "'\nAT_FN_DQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_sq_dparen",
-						script:        "if false; then function 'myfn'(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_SQ\n",
-						wantOut:       "'\nAT_FN_SQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_hyphen_dparen",
-						script:        "if false; then function my-fn(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_HY\n",
-						wantOut:       "'\nAT_FN_HY\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_a0_dparen",
-						script:        "if false; then function a[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_A0\n",
-						wantOut:       "'\nAT_FN_A0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_arr0_dparen",
-						script:        "if false; then function arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_ARR0\n",
-						wantOut:       "'\nAT_FN_ARR0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_dollar_dparen",
-						script:        "if false; then function $name(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DLR\n",
-						wantOut:       "'\nAT_FN_DLR\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_param_eq_dparen",
-						script:        "if false; then function ${name:=myfn}(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_PEQ\n",
-						wantOut:       "'\nAT_FN_PEQ\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_backtick_dparen",
-						script:        "if false; then function `echo myfn`(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_BT\n",
-						wantOut:       "'\nAT_FN_BT\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_function_cmdsubst_dparen",
-						script:        "if false; then function $(echo myfn)(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_CS\n",
-						wantOut:       "'\nAT_FN_CS\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "prefix_attached_coproc_arr0_dparen",
-						script:        "if false; then coproc arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_C_ARR0\n",
-						wantOut:       "'\nAT_C_ARR0\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-						minBashMajor:  4,
-						minBashMinor:  0,
-					},
-					{
-						name:       "bare_ident_attached_dparen_syntax_error",
-						script:     "myfn(( 1 ))",
-						wantBashOK: false,
-					},
-					{
-						name:       "bare_dq_attached_dparen_syntax_error",
-						script:     `"myfn"(( 1 ))`,
-						wantBashOK: false,
-					},
-					{
-						name:          "downgraded_comsub_subshell_paren_depth_outside_param",
-						script:        "EOF() { :; }\nif false; then x=$(( true ) && ( echo ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_SUB\n",
-						wantOut:       "P2_SUB\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "downgraded_comsub_array_paren_depth_outside_param",
-						script:        "EOF() { :; }\nif false; then x=$(( true ) && a=( ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_ARR\n",
-						wantOut:       "P2_ARR\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-					{
-						name:          "downgraded_comsub_nested_subshell_paren_depth_outside_param",
-						script:        "EOF() { :; }\nif false; then x=$(( true ) && ( ( echo ${a:-(} ) ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_NSUB\n",
-						wantOut:       "P2_NSUB\n",
-						wantBashOK:    true,
-						wantDisable:   true,
-						checkDisables: true,
-					},
-				} {
-					t.Run(tc.name, func(t *testing.T) {
-						if tc.checkDisables {
-							if got := stepDisablesErrexit(tc.script); got != tc.wantDisable {
-								t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.script, got, tc.wantDisable)
-							}
-						}
-						if tc.minBashMajor > 0 && !bashVersionAtLeast(tc.minBashMajor, tc.minBashMinor) {
-							t.Logf("skipping bash >= %d.%d assertion on %s", tc.minBashMajor, tc.minBashMinor, bashBin)
-							return
-						}
-						out, runErr := exec.Command(bashBin, "--noprofile", "--norc", "-e", "-c", tc.script).CombinedOutput()
-						if tc.wantBashOK {
-							if runErr != nil {
-								t.Fatalf("bash failed unexpectedly: %v\n%s", runErr, out)
-							}
-							if got := string(out); got != tc.wantOut {
-								t.Fatalf("bash output = %q, want %q", got, tc.wantOut)
-							}
-						} else if runErr == nil {
-							t.Fatalf("expected bash non-zero exit, got ok output=%q", out)
-						}
-					})
+		var bashBin string
+		var bashMajor, bashMinor int
+		var bashHasVer bool
+		if runtime.GOOS != "windows" {
+			if foundBin, err := exec.LookPath("bash"); err == nil {
+				bashBin = foundBin
+				if verOut, verErr := exec.Command(bashBin, "--noprofile", "--norc", "-c", `printf '%s.%s' "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}"`).Output(); verErr == nil {
+					bashMajor, bashMinor, bashHasVer = parseBashMajorMinor(string(verOut))
+				}
+				if !bashVersionAtLeastPair(bashMajor, bashMinor, 3, 2, bashHasVer) || bashVersionAtLeastPair(bashMajor, bashMinor, 99, 0, bashHasVer) {
+					t.Fatalf("unexpected bash version gate sanity result for %s (%d.%d, parsed=%v)", bashBin, bashMajor, bashMinor, bashHasVer)
 				}
 			}
 		}
+
+		for _, gateTC := range []struct {
+			ver      string
+			wantMaj  int
+			wantMin  int
+			wantOK   bool
+			wantPass bool
+		}{
+			{ver: "3.2", wantMaj: 3, wantMin: 2, wantOK: true, wantPass: true},
+			{ver: "3.2", wantMaj: 4, wantMin: 0, wantOK: true, wantPass: false},
+			{ver: "3.2", wantMaj: 4, wantMin: 4, wantOK: true, wantPass: false},
+			{ver: "4.0", wantMaj: 4, wantMin: 0, wantOK: true, wantPass: true},
+			{ver: "4.3", wantMaj: 4, wantMin: 4, wantOK: true, wantPass: false},
+			{ver: "4.4", wantMaj: 4, wantMin: 4, wantOK: true, wantPass: true},
+			{ver: "5.1", wantMaj: 5, wantMin: 2, wantOK: true, wantPass: false},
+			{ver: "5.2", wantMaj: 5, wantMin: 2, wantOK: true, wantPass: true},
+			{ver: "bad", wantMaj: 3, wantMin: 2, wantOK: false, wantPass: false},
+		} {
+			maj, minorVer, ok := parseBashMajorMinor(gateTC.ver)
+			if ok != gateTC.wantOK || bashVersionAtLeastPair(maj, minorVer, gateTC.wantMaj, gateTC.wantMin, ok) != gateTC.wantPass {
+				t.Fatalf("version gate check(%q >= %d.%d) = (%d.%d, ok=%v), want pass=%v",
+					gateTC.ver, gateTC.wantMaj, gateTC.wantMin, maj, minorVer, ok, gateTC.wantPass)
+			}
+		}
+
+		type bashParityCase struct {
+			name          string
+			script        string
+			wantOut       string
+			wantBashOK    bool
+			minBashMajor  int
+			minBashMinor  int
+			wantDisable   bool
+			checkDisables bool
+		}
+		parityCases := []bashParityCase{
+			{
+				name:          "arith_param_cont_evaluates",
+				script:        "seed=2\nx=$(( ${seed:-0} \\\n  + \"${seed:-0}\" \\\n  + 1 ))\nprintf '%s' \"$x\"",
+				wantOut:       "5",
+				wantBashOK:    true,
+				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
+				minBashMinor:  4,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "cmd_arith_param_cont_evaluates",
+				script:        "(( ${seed:-0} \\\n  + ${other:-1} ))\nprintf ARITH_OK",
+				wantOut:       "ARITH_OK",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_length_nonboundary_hash",
+				script:        "arr=(1 2)\n(( ${#arr[@]} ))\nprintf LEN_OK",
+				wantOut:       "LEN_OK",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_hash_not_comment_single_line",
+				script:        "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF) ))\nset +e\nfalse\nprintf P1_1_SINGLE_OK",
+				wantOut:       "P1_1_SINGLE_OK",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_hash_not_comment_multiline",
+				script:        "seed=1\n(( ${seed:-1 # foo} + (1 <<EOF)\n))\nset +e\nfalse\nprintf P1_1_MULTI_OK",
+				wantOut:       "P1_1_MULTI_OK",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_hash_balanced_paren_not_comment",
+				script:        "seed=1\n(( ${seed:-1 # (foo)} + (1 <<EOF)\n))\nset +e\nfalse\nprintf P1_1_BALANCED_OK",
+				wantOut:       "P1_1_BALANCED_OK",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_bare_lbrace_unquoted",
+				script:        "seed=1\n(( ${seed:-{} + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_U_OK",
+				wantOut:       "BARE_U_OK",
+				wantBashOK:    true,
+				minBashMajor:  4, // Unbalanced unquoted '{' inside ${...} fixed via dolbrace_state in Bash 4.4.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_bare_lbrace_double_quoted",
+				script:        "seed=1\n(( \"${seed:-{}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_DQ_OK",
+				wantOut:       "BARE_DQ_OK",
+				wantBashOK:    true,
+				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_bare_lbrace_unmatched_rparen_downgrades",
+				script:        "seed='cat'\n(( ${seed:-{1} ) <<EOF\n'\nEOF\n)\nset +e\nfalse\nprintf BARE_RPAREN_OK",
+				wantOut:       "'\nBARE_RPAREN_OK",
+				wantBashOK:    true,
+				minBashMajor:  4, // Unbalanced unquoted '{' inside ${...} requires Bash 4.4+.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_hash_rparen_heredoc_bypass_downgrades",
+				script:        "seed='cat'\n(( ${seed:-1 # ) } <<EOF\n'\nEOF\n))\nset +e\nfalse\necho BYPASS_EXPLOIT_WORKS",
+				wantOut:       "'\nBYPASS_EXPLOIT_WORKS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_rparen_nohash_heredoc_bypass_downgrades",
+				script:        "seed='cat'\n(( ${seed:-)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho BYPASS_NOHASH_WORKS",
+				wantOut:       "'\nBYPASS_NOHASH_WORKS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_kgt0_adj_double_rparen_heredoc_bypass_downgrades",
+				script:        "seed='cat'\n(( ( ${seed:-))} <<EOF\n'\nEOF\n)))\nset +e\n: ')))' \\'\nfalse\necho CASE_A_OK",
+				wantOut:       "'\nCASE_A_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_k0_unsplit_double_rparen_if_false_bitshift_bypass",
+				script:        "EOF() { :; }\nif false; then\n  { (( (1 <<EOF) + ${seed:-));}\nfi\nset +e\nfalse\necho CASE_B_OK\nEOF",
+				wantOut:       "CASE_B_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_k0_unsplit_double_rparen_if_false_heredoc_bypass",
+				script:        "if false; then { (( ${seed:-)) ; }; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ATK1_J_UNSPLIT_BYPASS",
+				wantOut:       "'\nATK1_J_UNSPLIT_BYPASS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_k0_unsplit_double_rparen_shortcircuit_heredoc_bypass",
+				script:        "false && { (( ${seed:-)) ; }\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ATK1_K_SHORTCIRCUIT_BYPASS",
+				wantOut:       "'\nATK1_K_SHORTCIRCUIT_BYPASS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_k0_unclosed_nextline_double_rparen_closes",
+				script:        "if false; then (( ${seed:-0\n))\nfi\nset +e\nfalse\necho CASE_D_OK",
+				wantOut:       "CASE_D_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_split_double_rparen_heredoc_bypass_downgrades",
+				script:        "seed='cat'\n(( ${seed:-)\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_D",
+				wantOut:       "'\nATK1_D\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Split closing parens )\\\n) inside (( )) downgrade/parsing fixed post-Bash 3.2.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_split_double_rparen_hash_heredoc_bypass_downgrades",
+				script:        "seed='cat'\n(( ${seed:-1 # )\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_F",
+				wantOut:       "'\nATK1_F\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Split closing parens )\\\n) inside (( )) downgrade/parsing fixed post-Bash 3.2.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "cmdsubst_arith_param_unclosed_split_double_rparen_closes",
+				script:        "if false; then x=$(( ${seed:-0\n)\\\n)\nfi\nset +e\nfalse\necho COMSUB_SPLIT_OK",
+				wantOut:       "COMSUB_SPLIT_OK\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Split closing parens )\\\n) inside $(( )) fixed post-Bash 3.2.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "cmdsubst_arith_param_unsplit_double_rparen_closes",
+				script:        "if false; then x=$(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COMSUB_UNSPLIT_OK",
+				wantOut:       "'\nCOMSUB_UNSPLIT_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_plain_split_closing_parens_downgrades_to_subshell_heredoc",
+				script:        "(( cat <<EOF )\\\n)\n'\nEOF\nset +e\nfalse\necho DPAREN_SPLIT_CAT_OK",
+				wantOut:       "'\nDPAREN_SPLIT_CAT_OK\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Split closing parens )\\\n) downgrade inside (( )) requires Bash 4.4+.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_plain_split_if_false_heredoc_swallows_set_e",
+				script:        "if false; then\n(( 1 <<EOF )\\\n)\nset +e\nEOF\nfi\nfalse\necho SHOULD_FAIL",
+				wantBashOK:    false,
+				minBashMajor:  4, // Split closing parens )\\\n) downgrade inside (( )) requires Bash 4.4+.
+				minBashMinor:  4,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_plain_unsplit_if_false_bitshift_runs_set_e",
+				script:        "EOF() { :; }\nif false; then\n(( 1 <<EOF ))\nfi\nset +e\nfalse\necho UNSPLIT_AFTER_OK\nEOF",
+				wantOut:       "UNSPLIT_AFTER_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "cmdsubst_arith_param_rparen_syntax_error",
+				script:        "seed='cat'\nx=$(( ${seed:-)} <<EOF\n'ok'\nEOF\n))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
+				wantBashOK:    false,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "cmdsubst_arith_param_double_quoted_rparen_ok",
+				script:        "seed=1\nx=$(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
+				wantOut:       "2_OK",
+				wantBashOK:    true,
+				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_double_quoted_rparen_stays_arith",
+				script:        "seed=1\n(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf DQ_RPAREN_OK",
+				wantOut:       "DQ_RPAREN_OK",
+				wantBashOK:    true,
+				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_double_quoted_dollar_single_arith_invariant",
+				script:        "seed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '32_OK'",
+				wantOut:       "32_OK",
+				wantBashOK:    true,
+				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "arith_param_double_quoted_dollar_single_closes_first_brace",
+				script:        "x=\"\"\nprintf '<%s>' \"${x:-$'1}2'}\"\nseed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf ' OK'",
+				wantOut:       "<12}> OK",
+				wantBashOK:    true,
+				minBashMajor:  5,
+				minBashMinor:  2,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_input_allows_spaced_array",
+				script:        "v=<(printf 1) arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_output_allows_spaced_array",
+				script:        "v=>(true) arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_glued_word_allows_spaced_array",
+				script:        "v=pre<(printf 1)post arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_nested_allows_spaced_array",
+				script:        "v=<(echo <(printf 1)) arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_multiline_allows_spaced_array",
+				script:        "v=<(printf 1\n) arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_heredoc_allows_spaced_array",
+				script:        "v=<(cat <<INNER\nhi\nINNER\nprintf 2) arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				minBashMajor:  4, // Heredocs inside command/process substitutions rewritten via parse_comsub in Bash 4.0.
+				minBashMinor:  0,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_glued_echo_allows_spaced_array",
+				script:        "v=<(printf 1)echo arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "assign_proc_subst_glued_hash_allows_spaced_array",
+				script:        "v=<(printf 1)#tag arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:       "REACHED",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:          "standalone_subshell_glued_hash_comments_rest_of_line",
+				script:        "(true)#tag && printf SHOULD_NOT_PRINT\nprintf DONE",
+				wantOut:       "DONE",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+			},
+			{
+				name:       "cmd_pos_proc_subst_fails_as_command",
+				script:     "<(printf 1) arr[ 1 << 2 ]=x",
+				wantBashOK: false,
+			},
+			{
+				name:       "after_prefix_assign_proc_subst_fails_as_command",
+				script:     "v=1 <(printf 1) arr[ 1 << 2 ]=x",
+				wantBashOK: false,
+			},
+			{
+				name:          "prefix_for_arith_param_adj_rparen",
+				script:        "if false; then for (( i=0; i<1; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho FOR_OK\n",
+				wantOut:       "FOR_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_coproc_arith_param_adj_rparen",
+				script:        "if false; then coproc (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_OK\n",
+				wantOut:       "'\nCOPROC_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_name_arith_param_adj_rparen",
+				script:        "if false; then coproc myco (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_NAME_OK\n",
+				wantOut:       "'\nCOPROC_NAME_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_time_arith_param_adj_rparen",
+				script:        "if false; then coproc time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_TIME_OK\n",
+				wantOut:       "'\nCOPROC_TIME_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_name_for_arith_param_adj_rparen",
+				script:        "if false; then coproc myco for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho COPROC_FOR_OK\n",
+				wantOut:       "COPROC_FOR_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_function_name_arith_param_adj_rparen",
+				script:        "if false; then function myfn (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_OK\n",
+				wantOut:       "'\nFN_KW_OK\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Braceless function <word> (( ... )) without () requires Bash 4.x+.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_name_parens_arith_param_adj_rparen",
+				script:        "if false; then function myfn() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_PARENS_OK\n",
+				wantOut:       "'\nFN_KW_PARENS_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_name_parens_arith_param_adj_rparen",
+				script:        "if false; then myfn() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_PARENS_OK\n",
+				wantOut:       "'\nFN_PARENS_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_bang_time_p_for_arith_param_adj_rparen",
+				script:        "if false; then ! time -p for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho BANG_TIME_FOR_OK\n",
+				wantOut:       "BANG_TIME_FOR_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "downgraded_comsub_double_paren_unwinds_param_and_cmdsubst",
+				script:        "if false; then x=$(( true ) && echo ${y:-)} ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DG5_OK\n",
+				wantOut:       "'\nDG5_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_unwinds_param_and_keeps_bitshift",
+				script:        "if false; then (( $(( true ) && echo ${y:-)} + (1 <<EOF) )); fi\nset +e\nfalse\necho DG9_OK\n",
+				wantOut:       "DG9_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "unclosed_comsub_double_paren_adj_rparen_unwinds_outer_cmdsubst",
+				script:        "if false; then x=$(( ${y:-)} && echo ${z:-)} ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DG2_OK\n",
+				wantOut:       "'\nDG2_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "top_level_dparen_downgraded_comsub_param_rparen_ok",
+				script:        "{ (( $(( true ) && echo ${y:-)} + (1 <<EOF) )); } 2>/dev/null || true\nset +e\nfalse\necho EXEC5_OK\n",
+				wantOut:       "EXEC5_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "downgraded_comsub_subshell_param_rparen_ok",
+				script:        "if false; then x=$(( true ) && (echo ${y:-)} ); fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho EXEC6_OK\n",
+				wantOut:       "'\nEXEC6_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "multiline_downgraded_comsub_param_closes_on_rparen",
+				script:        "if false; then x=$(( true ) && echo ${y:-0\n)\nfi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho MULTILINE_DG_OK\n",
+				wantOut:       "'\nMULTILINE_DG_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "benign_coproc_closed_downgraded_dparen_keeps_heredoc_inert",
+				script:        "if false; then coproc myco (( ${seed:-)} )); fi\ncat <<EOF\nset +e\nEOF\necho SAFE\n",
+				wantOut:       "set +e\nSAFE\n",
+				wantBashOK:    true,
+				wantDisable:   false,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "for_arith_header_avoids_bogus_bitshift_heredoc",
+				script:        "if false; then\nfor (( ; # \\\n( \\\na)\n1 << 2\n; 0 ))\ndo\nset +e\n2\ndone\nfi\necho FOR_SHIFT_OK\n",
+				wantOut:       "FOR_SHIFT_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "single_comsub_subshell_keeps_iswordparen_true_on_rparen",
+				script:        "if false; then (( $( ( true ) && echo ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_OK\n",
+				wantOut:       "SUB_DG_OK\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // parse_comsub added in Bash 4.0 for ) inside ${...} in $(...).
+				minBashMinor:  0,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "single_comsub_subshell_keeps_iswordparen_true_on_lparen",
+				script:        "if false; then (( $( ( true ) && echo ${y:-(} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_LPAREN_OK\n",
+				wantOut:       "SUB_DG_LPAREN_OK\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // parse_comsub added in Bash 4.0 for unclosed ( inside ${...} in $(...).
+				minBashMinor:  0,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:       "dparen_downgraded_comsub_rparen_outside_param_syntax_error",
+				script:     "(( $(( true ) && echo ${y:-)} ) + (1 <<EOF) ))",
+				wantBashOK: false,
+			},
+			{
+				name:       "dparen_downgraded_comsub_lparen_outside_param_syntax_error",
+				script:     "(( $(( true ) && echo ${y:-(} ) + (1 <<EOF) ))",
+				wantBashOK: false,
+			},
+			{
+				name:          "downgraded_comsub_nested_subshell_preserves_param_expand",
+				script:        "if false; then x=$(( true ) && ( echo ${y:-1 ) <<EOF } ); fi\nset +e\nfalse\necho P1_HEREDOC\n",
+				wantOut:       "P1_HEREDOC\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "downgraded_comsub_synth_subshell_preserves_param_expand",
+				script:        "if false; then x=$(( true ) && ( echo ${a:-(} && echo ${b:-1 ) <<EOF } ) ); fi\nset +e\nfalse\necho P1_SYNTH_HEREDOC\n",
+				wantOut:       "P1_SYNTH_HEREDOC\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_nested_subshell_param_hash",
+				script:        "if false; then (( $(( true ) && ( echo ${y:-1 ) # } ) + (1 <<EOF) )); fi\nset +e\nfalse\necho P1_HASH_A\n",
+				wantOut:       "P1_HASH_A\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_synth_subshell_param_hash",
+				script:        "if false; then (( $(( true ) && ( echo ${a:-(} && echo ${b:-1 ) # } ) ) + (1 <<EOF) )); fi\nset +e\nfalse\necho P1_HASH_B\n",
+				wantOut:       "P1_HASH_B\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_funcdef_parens_for_arith",
+				script:        "if false; then myfn() for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho FN_FOR\n",
+				wantOut:       "FN_FOR\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_keyword_if_dparen",
+				script:        "if false; then function myfn if (( ${seed:-)) ; then :; fi; fi\nset +e\nfalse\necho FNKW_IF\n",
+				wantOut:       "FNKW_IF\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Braceless function <word> <compound> with (( requires Bash 4.4+.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_array_literal_param_rparen",
+				script:        "if false; then (( $(( true ) && a=( ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR1\n",
+				wantOut:       "ARR1\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_plus_array_literal_param_rparen",
+				script:        "if false; then (( $(( true ) && a+=( ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR2\n",
+				wantOut:       "ARR2\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_array_literal_nested_subshell",
+				script:        "if false; then (( $(( true ) && a=( ( echo ${y:-)} ) ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR_NS\n",
+				wantOut:       "ARR_NS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "dparen_downgraded_comsub_array_literal_dq_param_ok",
+				script:        "if false; then (( $(( true ) && a=( \"${y:-)}\" ) ) + (1 <<EOF) )); fi\nset +e\nfalse\necho ARR_DQ_OK\n",
+				wantOut:       "ARR_DQ_OK\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:       "dparen_downgraded_comsub_array_literal_extra_rparen_syntax_error",
+				script:     "if false; then (( $(( true ) && a=( ${y:-)} ) ) + (1 <<EOF) )); fi",
+				wantBashOK: false,
+			},
+			{
+				name:          "prefix_coproc_hyphen_name_dparen",
+				script:        "if false; then coproc my-co (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_HYPH\n",
+				wantOut:       "'\nC_HYPH\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_dot_name_dparen",
+				script:        "if false; then coproc foo.bar (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DOT\n",
+				wantOut:       "'\nC_DOT\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_quoted_name_dparen",
+				script:        "if false; then coproc \"myco\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ\n",
+				wantOut:       "'\nC_DQ\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_hyphen_name_for_arith",
+				script:        "if false; then coproc my-co for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho C_HYPH_FOR\n",
+				wantOut:       "C_HYPH_FOR\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_function_reserved_if_dparen",
+				script:        "if false; then function if (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_IF\n",
+				wantOut:       "'\nFN_KW_IF\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Reserved words, quotes, and expansions as function names with (( require Bash 4.4+.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_reserved_for_dparen",
+				script:        "if false; then function for (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_FOR\n",
+				wantOut:       "'\nFN_KW_FOR\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_reserved_time_dparen",
+				script:        "if false; then function time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_TIME\n",
+				wantOut:       "'\nFN_KW_TIME\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_reserved_fi_dparen",
+				script:        "if false; then function fi (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_FI\n",
+				wantOut:       "'\nFN_KW_FI\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_quoted_name_dparen",
+				script:        "if false; then function \"myfn\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_DQ\n",
+				wantOut:       "'\nFN_DQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_reserved_if_parens_dparen",
+				script:        "if false; then function if() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_IFP\n",
+				wantOut:       "'\nFN_IFP\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_quoted_funcdef_parens_dparen",
+				script:        "if false; then \"myfn\"() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DQ_P\n",
+				wantOut:       "'\nDQ_P\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_hyphen_funcdef_parens_dparen",
+				script:        "if false; then my-fn() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho HYPH_P\n",
+				wantOut:       "'\nHYPH_P\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:       "prefix_funcdef_parens_coproc_syntax_error",
+				script:     "if false; then myfn() coproc (( 1 )); fi",
+				wantBashOK: false,
+			},
+			{
+				name:       "prefix_coproc_two_words_syntax_error",
+				script:     "if false; then coproc \"myco\" foo (( 1 )); fi",
+				wantBashOK: false,
+			},
+			{
+				name:          "for_arith_inner_closed_by_param_rparen_keeps_outer_unclosed",
+				script:        "if false; then for (( ; for (( ;; ${seed:-)) ; do :; done; fi\nset +e\n",
+				wantBashOK:    false,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "for_arith_param_double_rparen_valid_bash",
+				script:        "if false; then for (( ;; ${seed:-)) ; do :; done; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FOR_VALID\n",
+				wantOut:       "'\nFOR_VALID\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_redir_dq_allows_arr_shift_assign",
+				script:        "if false; then >\"out\" arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_DQ\n",
+				wantOut:       "R_DQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4, // Prefix redirections preserving array assignment state require Bash 4.4+.
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_redir_sq_allows_arr_shift_assign",
+				script:        "if false; then >'out' arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_SQ\n",
+				wantOut:       "R_SQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_redir_dollar_allows_arr_shift_assign",
+				script:        "if false; then >$out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_VAR\n",
+				wantOut:       "R_VAR\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_redir_esc_allows_arr_shift_assign",
+				script:        "if false; then >\\out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_ESC\n",
+				wantOut:       "R_ESC\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_redir_backtick_allows_arr_shift_assign",
+				script:        "if false; then >`echo out` arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_BT\n",
+				wantOut:       "R_BT\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:       "prefix_redir_dq_parens_syntax_error",
+				script:     "if false; then >\"out\"() (( 1 )); fi",
+				wantBashOK: false,
+			},
+			{
+				name:          "prefix_function_param_default_dparen",
+				script:        "if false; then function ${name:-myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_DEF\n",
+				wantOut:       "'\nFN_P_DEF\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_param_assign_dparen",
+				script:        "if false; then function ${name:=myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_EQ\n",
+				wantOut:       "'\nFN_P_EQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_nested_param_dparen",
+				script:        "if false; then function ${a:-${b:-myfn}} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_NEST\n",
+				wantOut:       "'\nFN_P_NEST\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_arith_name_dparen",
+				script:        "if false; then function $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARITH\n",
+				wantOut:       "'\nFN_ARITH\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_param_parens_dparen",
+				script:        "if false; then ${name:-myfn}() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho P_PARENS\n",
+				wantOut:       "'\nP_PARENS\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_arith_parens_dparen",
+				script:        "if false; then $((1+1))() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho A_PARENS\n",
+				wantOut:       "'\nA_PARENS\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_coproc_param_assign_op_dparen",
+				script:        "if false; then coproc ${var:=myco} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_P_EQ\n",
+				wantOut:       "'\nC_P_EQ\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_dq_eq_dparen",
+				script:        "if false; then coproc \"a=b\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ_EQ\n",
+				wantOut:       "'\nC_DQ_EQ\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_esc_eq_dparen",
+				script:        "if false; then coproc a\\=b (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ESC_EQ\n",
+				wantOut:       "'\nC_ESC_EQ\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_arith_name_dparen",
+				script:        "if false; then coproc $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARITH\n",
+				wantOut:       "'\nC_ARITH\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:       "prefix_coproc_assign_word_syntax_error",
+				script:     "if false; then coproc a=1 (( 1 )); fi",
+				wantBashOK: false,
+			},
+			{
+				name:       "prefix_coproc_arr_assign_word_syntax_error",
+				script:     "if false; then coproc a[0]=1 (( 1 )); fi",
+				wantBashOK: false,
+			},
+			{
+				name:          "prefix_coproc_backtick_space_dparen",
+				script:        "if false; then coproc `echo myco` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_BT\n",
+				wantOut:       "'\nC_BT\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_function_backtick_space_dparen",
+				script:        "if false; then function `echo myfn` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_BT\n",
+				wantOut:       "'\nFN_BT\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_backtick_space_parens_dparen",
+				script:        "if false; then `echo myfn`() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho BT_P\n",
+				wantOut:       "'\nBT_P\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_coproc_subscript_a0_dparen",
+				script:        "if false; then coproc a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUB0\n",
+				wantOut:       "'\nC_SUB0\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_subscript_shift_dparen",
+				script:        "if false; then coproc a[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBS\n",
+				wantOut:       "'\nC_SUBS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_subscript_quoted_eq_dparen",
+				script:        "if false; then coproc a[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBQ\n",
+				wantOut:       "'\nC_SUBQ\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_function_subscript_a0_dparen",
+				script:        "if false; then function a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_SUB0\n",
+				wantOut:       "'\nFN_SUB0\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_subscript_shift_parens_dparen",
+				script:        "if false; then a[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho SUB_P\n",
+				wantOut:       "'\nSUB_P\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_coproc_multi_subscript_arr0_dparen",
+				script:        "if false; then coproc arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARR0\n",
+				wantOut:       "'\nC_ARR0\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_multi_subscript_shift_dparen",
+				script:        "if false; then coproc arr[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRS\n",
+				wantOut:       "'\nC_ARRS\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_coproc_multi_subscript_quoted_eq_dparen",
+				script:        "if false; then coproc arr[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRQ\n",
+				wantOut:       "'\nC_ARRQ\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:          "prefix_multi_subscript_shift_parens_dparen",
+				script:        "if false; then arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ARR_P\n",
+				wantOut:       "'\nARR_P\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_time_multi_subscript_shift_parens_dparen",
+				script:        "if false; then time arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho T_ARR_P\n",
+				wantOut:       "'\nT_ARR_P\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_function_multi_subscript_arr0_dparen",
+				script:        "if false; then function arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARR0\n",
+				wantOut:       "'\nFN_ARR0\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_dq_dparen",
+				script:        "if false; then function \"myfn\"(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DQ\n",
+				wantOut:       "'\nAT_FN_DQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_sq_dparen",
+				script:        "if false; then function 'myfn'(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_SQ\n",
+				wantOut:       "'\nAT_FN_SQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_hyphen_dparen",
+				script:        "if false; then function my-fn(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_HY\n",
+				wantOut:       "'\nAT_FN_HY\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_a0_dparen",
+				script:        "if false; then function a[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_A0\n",
+				wantOut:       "'\nAT_FN_A0\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_arr0_dparen",
+				script:        "if false; then function arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_ARR0\n",
+				wantOut:       "'\nAT_FN_ARR0\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_dollar_dparen",
+				script:        "if false; then function $name(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DLR\n",
+				wantOut:       "'\nAT_FN_DLR\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_param_eq_dparen",
+				script:        "if false; then function ${name:=myfn}(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_PEQ\n",
+				wantOut:       "'\nAT_FN_PEQ\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_backtick_dparen",
+				script:        "if false; then function `echo myfn`(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_BT\n",
+				wantOut:       "'\nAT_FN_BT\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_function_cmdsubst_dparen",
+				script:        "if false; then function $(echo myfn)(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_CS\n",
+				wantOut:       "'\nAT_FN_CS\n",
+				wantBashOK:    true,
+				minBashMajor:  4,
+				minBashMinor:  4,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "prefix_attached_coproc_arr0_dparen",
+				script:        "if false; then coproc arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_C_ARR0\n",
+				wantOut:       "'\nAT_C_ARR0\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+				minBashMajor:  4,
+				minBashMinor:  0,
+			},
+			{
+				name:       "bare_ident_attached_dparen_syntax_error",
+				script:     "myfn(( 1 ))",
+				wantBashOK: false,
+			},
+			{
+				name:       "bare_dq_attached_dparen_syntax_error",
+				script:     `"myfn"(( 1 ))`,
+				wantBashOK: false,
+			},
+			{
+				name:          "downgraded_comsub_subshell_paren_depth_outside_param",
+				script:        "EOF() { :; }\nif false; then x=$(( true ) && ( echo ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_SUB\n",
+				wantOut:       "P2_SUB\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "downgraded_comsub_array_paren_depth_outside_param",
+				script:        "EOF() { :; }\nif false; then x=$(( true ) && a=( ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_ARR\n",
+				wantOut:       "P2_ARR\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+			{
+				name:          "downgraded_comsub_nested_subshell_paren_depth_outside_param",
+				script:        "EOF() { :; }\nif false; then x=$(( true ) && ( ( echo ${a:-(} ) ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_NSUB\n",
+				wantOut:       "P2_NSUB\n",
+				wantBashOK:    true,
+				wantDisable:   true,
+				checkDisables: true,
+			},
+		}
+
+		// Verify under a simulated Bash 3.2 host that scanner assertions remain
+		// active for every case while Bash 3.2-safe live cases stay enabled.
+		var sim32ScannerCount, sim32LiveCount, sim32GatedCount int
+		for _, tc := range parityCases {
+			if tc.checkDisables || tc.wantBashOK {
+				sim32ScannerCount++
+			}
+			if tc.minBashMajor == 0 || bashVersionAtLeastPair(3, 2, tc.minBashMajor, tc.minBashMinor, true) {
+				sim32LiveCount++
+			} else {
+				sim32GatedCount++
+			}
+		}
+		if sim32ScannerCount == 0 || sim32LiveCount < 30 || sim32GatedCount == 0 {
+			t.Fatalf("unexpected Bash 3.2 gate distribution: scanner=%d live32=%d gated=%d", sim32ScannerCount, sim32LiveCount, sim32GatedCount)
+		}
+
+		for _, tc := range parityCases {
+			t.Run(tc.name, func(t *testing.T) {
+				if tc.checkDisables {
+					if got := stepDisablesErrexit(tc.script); got != tc.wantDisable {
+						t.Fatalf("stepDisablesErrexit(%q) = %v, want %v", tc.script, got, tc.wantDisable)
+					}
+				}
+				if tc.wantBashOK {
+					if _, err := activeBashCodeLinesChecked(tc.script); err != nil {
+						t.Fatalf("activeBashCodeLinesChecked(%q) unexpected error: %v", tc.script, err)
+					}
+				}
+				if bashBin == "" {
+					t.Logf("skipping live bash execution: bash unavailable or unsupported OS (%s)", runtime.GOOS)
+					return
+				}
+				if tc.minBashMajor > 0 && !bashVersionAtLeastPair(bashMajor, bashMinor, tc.minBashMajor, tc.minBashMinor, bashHasVer) {
+					t.Logf("skipping live bash >= %d.%d assertion on %s (%d.%d)", tc.minBashMajor, tc.minBashMinor, bashBin, bashMajor, bashMinor)
+					return
+				}
+				out, runErr := exec.Command(bashBin, "--noprofile", "--norc", "-e", "-c", tc.script).CombinedOutput()
+				if tc.wantBashOK {
+					if runErr != nil {
+						t.Fatalf("bash failed unexpectedly: %v\n%s", runErr, out)
+					}
+					if got := string(out); got != tc.wantOut {
+						t.Fatalf("bash output = %q, want %q", got, tc.wantOut)
+					}
+				} else if runErr == nil {
+					t.Fatalf("expected bash non-zero exit, got ok output=%q", out)
+				}
+			})
+		}
 	})
+}
+
+func BenchmarkSplitBashStatementsMultilineCmdSubst(b *testing.B) {
+	for _, n := range []int{256, 1024, 4096} {
+		src := strings.Repeat("echo \"${VAR:-$(printf item)}\"\n", n)
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				stmts, _ := splitBashStatementsForErrexitDepth(src, 0, bashParamScanOpts{allowSingleInDouble: true})
+				if len(stmts) != 2*n {
+					b.Fatalf("len(stmts) = %d, want %d", len(stmts), 2*n)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkScanBashCmdSubstWithCache(b *testing.B) {
+	unit := "x=$(\n  echo 1\n)\n"
+	const nOffsets = 1024
+	src := strings.Repeat(unit, nOffsets)
+	b.ReportAllocs()
+	for b.Loop() {
+		var cache *bashLineIndex
+		for i := range nOffsets {
+			if _, _, ok := scanBashCmdSubstWithCache(src, &cache, i*len(unit)+2, true, nil); !ok {
+				b.Fatalf("offset %d failed", i)
+			}
+		}
+	}
+}
+
+func BenchmarkScanBashDoubleParenWithCache(b *testing.B) {
+	unit := "(( echo ok )\n"
+	const nOffsets = 1024
+	src := strings.Repeat(unit, nOffsets)
+	b.ReportAllocs()
+	for b.Loop() {
+		var cache *bashLineIndex
+		for i := range nOffsets {
+			_, _, _, _ = scanBashDoubleParenWithCache(src, &cache, i*len(unit), false, true, nil)
+		}
+	}
 }
