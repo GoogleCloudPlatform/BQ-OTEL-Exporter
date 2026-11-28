@@ -26359,13 +26359,42 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			bashFeatArithDoubleQuotedDollarSingle:  true,
 			bashFeatCoproc:                         false,
 			bashFeatBangTimeForArith:               false,
-			bashFeatDoubleQuotedDollarSingleBrace:  false,
-			bashFeatDparenBareLBraceDowngrade:      false,
+			bashFeatDoubleQuotedDollarSingleBrace:  true,
+			bashFeatDparenBareLBraceDowngrade:      true,
 			bashFeatDparenSplitParenDowngrade:      false,
 			bashFeatDparenParamSplitRparen:         true,
 			bashFeatDparenParamHashSplitRparen:     true,
-			bashFeatCmdSubstSplitDoubleRparen:      false,
-			bashFeatCmdSubstSubshellParamParen:     true,
+			bashFeatCmdSubstSplitDoubleRparen:      true,
+			bashFeatCmdSubstSubshellParamParen:     false,
+		}
+		verifySim32FeaturesMatchLive := func(sim map[bashFeature]bool, eval func(bashFeature) (bool, error)) error {
+			if eval == nil {
+				return errors.New("verifySim32FeaturesMatchLive called with nil evaluator")
+			}
+			var mismatches []string
+			for _, feat := range slices.Sorted(maps.Keys(bashFeatureProbes)) {
+				simOK, ok := sim[feat]
+				if !ok {
+					mismatches = append(mismatches, fmt.Sprintf("%s: missing from sim32Features", feat))
+					continue
+				}
+				liveOK, err := eval(feat)
+				if err != nil {
+					return fmt.Errorf("probe %s failed: %w", feat, err)
+				}
+				if simOK != liveOK {
+					mismatches = append(mismatches, fmt.Sprintf("%s: sim=%v, live=%v", feat, simOK, liveOK))
+				}
+			}
+			for _, feat := range slices.Sorted(maps.Keys(sim)) {
+				if _, ok := bashFeatureProbes[feat]; !ok {
+					mismatches = append(mismatches, fmt.Sprintf("%s: unexpected key not in bashFeatureProbes", feat))
+				}
+			}
+			if len(mismatches) > 0 {
+				return fmt.Errorf("sim32Features drifted from live Bash 3.2: %s", strings.Join(mismatches, "; "))
+			}
+			return nil
 		}
 		if len(sim32Features) != len(bashFeatureProbes) {
 			t.Fatalf("sim32Features covers %d features, want all %d bashFeatureProbes", len(sim32Features), len(bashFeatureProbes))
@@ -26398,10 +26427,77 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				sim32FeatureEligibleCount++
 			}
 		}
-		if sim32ScannerCount == 0 || sim32UngatedCount < 60 || sim32FeatureEligibleCount < 65 || sim32FeatureGatedCount < 25 || sim32SyntaxProbedCount < 50 {
-			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: scanner=%d ungated=%d featEligible=%d featGated=%d syntaxProbed=%d",
-				sim32ScannerCount, sim32UngatedCount, sim32FeatureEligibleCount, sim32FeatureGatedCount, sim32SyntaxProbedCount)
+		const (
+			wantSim32ScannerCount         = 122
+			wantSim32UngatedCount         = 60
+			wantSim32FeatureEligibleCount = 70
+			wantSim32FeatureGatedCount    = 28
+			wantSim32SyntaxProbedCount    = 53
+		)
+		if sim32ScannerCount != wantSim32ScannerCount ||
+			sim32UngatedCount != wantSim32UngatedCount ||
+			sim32FeatureEligibleCount != wantSim32FeatureEligibleCount ||
+			sim32FeatureGatedCount != wantSim32FeatureGatedCount ||
+			sim32SyntaxProbedCount != wantSim32SyntaxProbedCount {
+			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: got scanner=%d ungated=%d featEligible=%d featGated=%d syntaxProbed=%d, want %d/%d/%d/%d/%d",
+				sim32ScannerCount, sim32UngatedCount, sim32FeatureEligibleCount, sim32FeatureGatedCount, sim32SyntaxProbedCount,
+				wantSim32ScannerCount, wantSim32UngatedCount, wantSim32FeatureEligibleCount, wantSim32FeatureGatedCount, wantSim32SyntaxProbedCount)
 		}
+
+		t.Run("sim32_features_live_drift_check", func(t *testing.T) {
+			if err := verifySim32FeaturesMatchLive(sim32Features, nil); err == nil {
+				t.Fatal("nil evaluator error = nil, want non-nil error")
+			}
+
+			called := make(map[bashFeature]int, len(bashFeatureProbes))
+			if err := verifySim32FeaturesMatchLive(sim32Features, func(feat bashFeature) (bool, error) {
+				called[feat]++
+				val, ok := sim32Features[feat]
+				if !ok {
+					return false, fmt.Errorf("unexpected feature %q", feat)
+				}
+				return val, nil
+			}); err != nil {
+				t.Fatalf("matching evaluator unexpectedly failed: %v", err)
+			}
+			if len(called) != len(bashFeatureProbes) {
+				t.Fatalf("verifySim32FeaturesMatchLive evaluated %d features, want %d", len(called), len(bashFeatureProbes))
+			}
+
+			flipped := maps.Clone(sim32Features)
+			flipped[bashFeatProcSubstHeredoc] = !flipped[bashFeatProcSubstHeredoc]
+			if err := verifySim32FeaturesMatchLive(flipped, func(feat bashFeature) (bool, error) {
+				return sim32Features[feat], nil
+			}); err == nil || !strings.Contains(err.Error(), string(bashFeatProcSubstHeredoc)) || !strings.Contains(err.Error(), "sim=") {
+				t.Fatalf("flipped %s error = %v, want mismatch error naming %s", bashFeatProcSubstHeredoc, err, bashFeatProcSubstHeredoc)
+			}
+
+			missing := maps.Clone(sim32Features)
+			delete(missing, bashFeatCoproc)
+			if err := verifySim32FeaturesMatchLive(missing, func(feat bashFeature) (bool, error) {
+				return sim32Features[feat], nil
+			}); err == nil || !strings.Contains(err.Error(), string(bashFeatCoproc)) || !strings.Contains(err.Error(), "missing") {
+				t.Fatalf("missing key error = %v, want missing error naming %s", err, bashFeatCoproc)
+			}
+
+			extra := maps.Clone(sim32Features)
+			extra[bashFeature("bogus_feat")] = true
+			if err := verifySim32FeaturesMatchLive(extra, func(feat bashFeature) (bool, error) {
+				return sim32Features[feat], nil
+			}); err == nil || !strings.Contains(err.Error(), "bogus_feat") {
+				t.Fatalf("extra key error = %v, want error naming bogus_feat", err)
+			}
+
+			sentinelErr := errors.New("probe launch failed")
+			if err := verifySim32FeaturesMatchLive(sim32Features, func(feat bashFeature) (bool, error) {
+				if feat == bashFeatCoproc {
+					return false, sentinelErr
+				}
+				return sim32Features[feat], nil
+			}); !errors.Is(err, sentinelErr) {
+				t.Fatalf("evaluator error = %v, want errors.Is(_, %v)", err, sentinelErr)
+			}
+		})
 
 		var liveSkipped int
 		for _, tc := range parityCases {
@@ -26454,6 +26550,11 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 					t.Fatalf("expected bash non-zero exit, got ok output=%q", out)
 				}
 			})
+		}
+		if bashBin != "" && bashHasVer && bashMajor == 3 && bashMinor == 2 {
+			if err := verifySim32FeaturesMatchLive(sim32Features, bashSupportsFeature); err != nil {
+				t.Fatalf("bash %s (%d.%d) live capability mismatch against sim32Features: %v", bashBin, bashMajor, bashMinor, err)
+			}
 		}
 		if bashBin != "" && bashVersionAtLeastPair(bashMajor, bashMinor, 5, 3, bashHasVer) {
 			for feat := range bashFeatureProbes {
