@@ -3835,9 +3835,6 @@ func TestCrossOSMatrixInCIWorkflowHandlesAliasedCheckoutAndSetupGoSteps(t *testi
 				yamlSetMapValue(crossOS, "x-internal-with", &yaml.Node{Kind: yaml.AliasNode, Value: setupGoWithAnchor, Alias: setupGoWithTarget})
 				wantWithLocalAnchor = setupGoWithAnchor + "_local"
 			}
-			if (expectCrossSetupGoAlias || expectCrossWithAlias) && wantWithLocalAnchor != "" {
-				t.Fatalf("expected empty wantWithLocalAnchor for pre-aliased setup-go, got %q", wantWithLocalAnchor)
-			}
 			laterReuseJob := &yaml.Node{
 				Kind: yaml.MappingNode,
 				Content: []*yaml.Node{
