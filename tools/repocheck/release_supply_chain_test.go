@@ -932,6 +932,8 @@ type bashLexFrame struct {
 	namedFDHasContent       bool
 	caseStage               bashCaseStage
 	headerStage             bashHeaderStage
+	arrPrevHeader           bashHeaderStage
+	arrPrevCmdStart         bool
 	prefixRedirStage        bashPrefixRedirStage
 	cmdStarted              bool
 	assignDisallowed        bool
@@ -1881,11 +1883,11 @@ func (s *bashScanState) removeFrameAt(idx int) {
 }
 
 func (s *bashScanState) pruneUnclosedForDParens() {
-	if len(s.frames) != 1 || !s.frames[0].fromForArith {
+	if len(s.frames) == 0 || s.frames[0].kind != bashFrameArith || !s.frames[0].fromForArith {
 		return
 	}
 	depth := s.frames[0].parenDepth
-	for len(s.unclosedForDParens) > 0 && depth <= s.unclosedForDParens[len(s.unclosedForDParens)-1].minEntryDepth+1 {
+	for len(s.unclosedForDParens) > 0 && depth <= s.unclosedForDParens[len(s.unclosedForDParens)-1].minEntryDepth {
 		s.unclosedForDParens = s.unclosedForDParens[:len(s.unclosedForDParens)-1]
 	}
 }
@@ -2093,6 +2095,10 @@ func isBashHeaderWordStage(hs bashHeaderStage) bool {
 }
 
 func (s *bashScanState) enterHeaderWordQuoteOrDollar(atWordStart bool) {
+	if s.prefixRedirStage() != bashPrefixRedirNone {
+		s.setHeaderStage(bashHeaderNone)
+		return
+	}
 	switch s.headerStage() {
 	case bashHeaderFuncKeyword, bashHeaderFuncKeywordWord:
 		s.setHeaderStage(bashHeaderFuncKeywordWord)
@@ -2991,7 +2997,9 @@ func (s *bashScanState) closeArithAtDoubleParen(arithIdx int, stopOnEmpty bool, 
 		s.setHeaderStage(bashHeaderNone)
 		*atWordStart = true
 	} else {
-		s.noteWordCompleted()
+		if !s.isQuoted() && s.topKind() != bashFrameParamExpand {
+			s.completeHeaderWordPart()
+		}
 		*atWordStart = false
 	}
 	return false
@@ -3258,7 +3266,9 @@ func (s *bashScanState) scanLineForCont(
 				continue
 			}
 			s.popFrame()
-			s.completeHeaderWordPart()
+			if !s.isQuoted() && s.topKind() != bashFrameParamExpand {
+				s.completeHeaderWordPart()
+			}
 			atWordStart = false
 			continue
 		}
@@ -3290,7 +3300,9 @@ func (s *bashScanState) scanLineForCont(
 				}
 			case '"':
 				s.popFrame()
-				s.completeHeaderWordPart()
+				if !s.isQuoted() && s.topKind() != bashFrameParamExpand {
+					s.completeHeaderWordPart()
+				}
 				atWordStart = false
 				newTop := s.topKind()
 				isAllowedOuter := newTop == bashFrameNone || newTop == bashFrameCmdSubst || newTop == bashFrameSubshell || newTop == bashFrameArrayLiteral || (newTop == bashFrameCase && !s.frames[len(s.frames)-1].inPattern)
@@ -3375,7 +3387,13 @@ func (s *bashScanState) scanLineForCont(
 									if stopOnEmpty && len(s.frames) == 0 {
 										return "", false, i
 									}
-									s.noteWordCompleted()
+									if !s.isQuoted() && s.topKind() != bashFrameParamExpand {
+										if fromWordParen {
+											s.completeHeaderWordPart()
+										} else {
+											s.noteWordCompleted()
+										}
+									}
 									atWordStart = !fromWordParen
 								}
 							case s.frames[parenIdx].parenDepth > 0:
@@ -3419,8 +3437,8 @@ func (s *bashScanState) scanLineForCont(
 							}
 						}
 					}
-					if !s.isQuoted() {
-						s.noteWordCompleted()
+					if !s.isQuoted() && s.topKind() != bashFrameParamExpand {
+						s.completeHeaderWordPart()
 					}
 					atWordStart = false
 				}
@@ -3472,6 +3490,8 @@ func (s *bashScanState) scanLineForCont(
 						s.frames[last].namedFDHasContent = true
 					}
 				} else {
+					prevHeader := s.frames[last].arrPrevHeader
+					prevCmdStart := s.frames[last].arrPrevCmdStart
 					hasContent := s.frames[last].namedFDHasContent
 					s.popFrame()
 					if stopOnEmpty && len(s.frames) == 0 {
@@ -3506,7 +3526,18 @@ func (s *bashScanState) scanLineForCont(
 						s.noteAssignCompleted()
 					} else {
 						s.setInAssignRHS(false)
-						s.noteWordCompleted()
+						switch {
+						case prevHeader == bashHeaderCoproc:
+							s.setHeaderStage(bashHeaderCoprocNameWord)
+							s.setCmdStart(false)
+							s.setAssignDisallowed(true)
+						case prevCmdStart && (prevHeader == bashHeaderNone || prevHeader == bashHeaderTime || prevHeader == bashHeaderTimeDashP):
+							s.setHeaderStage(bashHeaderFuncNameWord)
+							s.setCmdStart(false)
+							s.setAssignDisallowed(true)
+						default:
+							s.noteWordCompleted()
+						}
 					}
 					atWordStart = false
 				}
@@ -4218,9 +4249,14 @@ func (s *bashScanState) scanLineForCont(
 					continue
 				}
 				if s.canAssign() && isBashWordIdentStart(ch) && i+1 < len(line) && line[i+1] == '[' {
+					prevCmdStart := s.atCmdStart()
 					i++
 					s.setHeaderStage(bashHeaderNone)
-					s.pushFrame(bashFrameArraySubscript)
+					s.frames = append(s.frames, bashLexFrame{
+						kind:            bashFrameArraySubscript,
+						arrPrevHeader:   hs,
+						arrPrevCmdStart: prevCmdStart,
+					})
 					atWordStart = false
 					continue
 				}
@@ -18606,8 +18642,33 @@ func scanBashBalancedSubExpr(s string, start int, openCh, closeCh byte) int {
 			if i+1 < len(s) {
 				i++
 			}
+		case '`':
+			if closeIdx, ok := findClosingRawBacktick(s, i+1); ok {
+				i = closeIdx
+			} else {
+				return len(s)
+			}
+		case '$':
+			if i+1 < len(s) {
+				switch s[i+1] {
+				case '\'':
+					if _, nextIdx, ok := parseBashAnsiCDelim(s, i+2); ok {
+						i = nextIdx
+						continue
+					}
+					return len(s)
+				case '{':
+					i = scanBashBalancedSubExpr(s, i+2, '{', '}')
+					continue
+				case '(':
+					i = scanBashBalancedSubExpr(s, i+2, '(', ')')
+					continue
+				}
+			}
 		case openCh:
-			depth++
+			if openCh != '{' {
+				depth++
+			}
 		case closeCh:
 			depth--
 		}
@@ -18616,7 +18677,7 @@ func scanBashBalancedSubExpr(s string, start int, openCh, closeCh byte) int {
 	return i
 }
 
-func readBashPrefixToken(s string, start int) (tok string, tokStart, tokEnd int, hasAttachedParen, hasQuotes bool) {
+func readBashPrefixToken(s string, start int, scanSubscript bool) (tok string, tokStart, tokEnd int, hasAttachedParen, hasQuotes bool) {
 	tokStart = start
 	for tokStart < len(s) && isBashWhitespace(s[tokStart]) {
 		tokStart++
@@ -18660,6 +18721,13 @@ func readBashPrefixToken(s string, start int) (tok string, tokStart, tokEnd int,
 			if tokEnd < len(s) {
 				tokEnd++
 			}
+		case '`':
+			hasQuotes = true
+			if closeIdx, ok := findClosingRawBacktick(s, tokEnd+1); ok {
+				tokEnd = closeIdx + 1
+			} else {
+				tokEnd = len(s)
+			}
 		case '$':
 			if tokEnd+1 < len(s) {
 				switch s[tokEnd+1] {
@@ -18669,6 +18737,8 @@ func readBashPrefixToken(s string, start int) (tok string, tokStart, tokEnd int,
 						tokEnd = nextIdx
 						continue
 					}
+					tokEnd = len(s)
+					continue
 				case '{':
 					tokEnd = scanBashBalancedSubExpr(s, tokEnd+2, '{', '}')
 					continue
@@ -18676,6 +18746,12 @@ func readBashPrefixToken(s string, start int) (tok string, tokStart, tokEnd int,
 					tokEnd = scanBashBalancedSubExpr(s, tokEnd+2, '(', ')')
 					continue
 				}
+			}
+			tokEnd++
+		case '[':
+			if scanSubscript && tokEnd > tokStart && isBashIdentWord(s[tokStart:tokEnd]) {
+				tokEnd = scanBashBalancedSubExpr(s, tokEnd+1, '[', ']')
+				continue
 			}
 			tokEnd++
 		case '(', ')', '<', '>', '&', '|', ';':
@@ -18705,15 +18781,42 @@ func consumeEmptyFuncParensAt(s string, afterTok int) (afterEnd int, ok bool) {
 	return closeIdx + 1, true
 }
 
-func isBashCoprocPrefixWord(tok string, hasQuotes bool) bool {
-	if hasQuotes {
-		return tok != ""
+func isBashAssignmentWord(tok string) bool {
+	if len(tok) < 2 || !isBashWordIdentStart(tok[0]) {
+		return false
 	}
-	return tok != "" && tok != "!" && !strings.ContainsRune(tok, '=') && (!isBashReservedKeyword(tok) || tok == "time")
+	j := 1
+	for j < len(tok) && isBashWordIdentChar(tok[j]) {
+		j++
+	}
+	if j < len(tok) && tok[j] == '[' {
+		endSub := scanBashBalancedSubExpr(tok, j+1, '[', ']')
+		if endSub <= j+1 || endSub > len(tok) || tok[endSub-1] != ']' {
+			return false
+		}
+		j = endSub
+	}
+	if j >= len(tok) {
+		return false
+	}
+	if tok[j] == '=' {
+		return true
+	}
+	return tok[j] == '+' && j+1 < len(tok) && tok[j+1] == '='
+}
+
+func isBashCoprocPrefixWord(tok string, hasQuotes bool) bool {
+	if tok == "" || isBashAssignmentWord(tok) {
+		return false
+	}
+	if hasQuotes {
+		return true
+	}
+	return tok != "!" && (!isBashReservedKeyword(tok) || tok == "time")
 }
 
 func advanceCompoundBodyPrefix(rest string, bodyStart int) (nextK int, done, ok, isForArith bool) {
-	bodyTok, bodyStartTok, bodyEndTok, bodyParen, bodyQuoted := readBashPrefixToken(rest, bodyStart)
+	bodyTok, bodyStartTok, bodyEndTok, bodyParen, bodyQuoted := readBashPrefixToken(rest, bodyStart, false)
 	if bodyStartTok >= len(rest) {
 		return 0, true, true, false
 	}
@@ -18736,7 +18839,7 @@ func isBashDoubleParenCmdPrefix(curStr string) (ok, isForArith bool) {
 	}
 	inTimeOpts := false
 	for k := 0; k < len(rest); {
-		tok, _, tokEnd, hasAttachedParen, hasQuotes := readBashPrefixToken(rest, k)
+		tok, _, tokEnd, hasAttachedParen, hasQuotes := readBashPrefixToken(rest, k, true)
 		if tok == "" {
 			return false, false
 		}
@@ -18766,7 +18869,7 @@ func isBashDoubleParenCmdPrefix(curStr string) (ok, isForArith bool) {
 				}
 				return false, false
 			case "coproc":
-				nextTok, nextStart, nextEnd, nextParen, nextQuoted := readBashPrefixToken(rest, tokEnd)
+				nextTok, nextStart, nextEnd, nextParen, nextQuoted := readBashPrefixToken(rest, tokEnd, true)
 				if nextStart >= len(rest) {
 					return true, false
 				}
@@ -18790,7 +18893,7 @@ func isBashDoubleParenCmdPrefix(curStr string) (ok, isForArith bool) {
 				k = nextK
 				continue
 			case "function":
-				fnTok, fnStart, fnEnd, fnParen, _ := readBashPrefixToken(rest, tokEnd)
+				fnTok, fnStart, fnEnd, fnParen, _ := readBashPrefixToken(rest, tokEnd, false)
 				if fnStart >= len(rest) || fnTok == "" {
 					return false, false
 				}
@@ -18808,7 +18911,7 @@ func isBashDoubleParenCmdPrefix(curStr string) (ok, isForArith bool) {
 				continue
 			}
 		}
-		if !hasQuotes && isBashReservedKeyword(tok) {
+		if (!hasQuotes && isBashReservedKeyword(tok)) || isBashAssignmentWord(tok) {
 			return false, false
 		}
 		afterParens, hasParens := consumeEmptyFuncParensAt(rest, tokEnd)
@@ -23582,6 +23685,157 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantUnclosed: true,
 				wantDisable:  true,
 			},
+			{
+				name:         "unclosed outer for arith containing inner for arith closed via param rparen still detects body set +e",
+				script:       "for (( ; for (( ;; ${seed:-)) ; do set +e; done\n",
+				wantUnclosed: true,
+				wantDisable:  true,
+			},
+			{
+				name:        "prefix redir double-quoted target allows trailing array subscript assign",
+				script:      "if false; then >\"out\" arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redir single-quoted target allows trailing array subscript assign",
+				script:      "if false; then >'out' arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redir dollar variable target allows trailing array subscript assign",
+				script:      "if false; then >$out arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redir backslash target allows trailing array subscript assign",
+				script:      "if false; then >\\out arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redir backtick target allows trailing array subscript assign",
+				script:      "if false; then >`echo out` arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "prefix redir spaced double-quoted target allows trailing array subscript assign",
+				script:      "if false; then > \"out\" arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function param default name dparen exposes set +e",
+				script:      "if false; then function ${name:-myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function param assign name dparen exposes set +e",
+				script:      "if false; then function ${name:=myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function nested param name dparen exposes set +e",
+				script:      "if false; then function ${a:-${b:-myfn}} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function arith name dparen exposes set +e",
+				script:      "if false; then function $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "param name parens dparen exposes set +e",
+				script:      "if false; then ${name:-myfn}() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "arith name parens dparen exposes set +e",
+				script:      "if false; then $((1+1))() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc param eq name dparen exposes set +e",
+				script:      "if false; then coproc ${var:=myco} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc double-quoted eq name dparen exposes set +e",
+				script:      "if false; then coproc \"a=b\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc escaped eq name dparen exposes set +e",
+				script:      "if false; then coproc a\\=b (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc arith name dparen exposes set +e",
+				script:      "if false; then coproc $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc backtick space name dparen exposes set +e",
+				script:      "if false; then coproc `echo myco` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function backtick space name dparen exposes set +e",
+				script:      "if false; then function `echo myfn` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "backtick space name parens dparen exposes set +e",
+				script:      "if false; then `echo myfn`() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc subscript a0 dparen exposes set +e",
+				script:      "if false; then coproc a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc subscript bitshift dparen exposes set +e",
+				script:      "if false; then coproc a[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc subscript quoted eq dparen exposes set +e",
+				script:      "if false; then coproc a[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function subscript a0 dparen exposes set +e",
+				script:      "if false; then function a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "subscript bitshift parens dparen exposes set +e",
+				script:      "if false; then a[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc assign followed by arr subscript assign preserves canAssign",
+				script:      "if false; then coproc a=1 arr[ 1 << 2 ]=x; fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "downgraded cmdsubst subshell parenDepth decrements before param heredoc",
+				script:      "if false; then x=$(( true ) && ( echo ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "downgraded cmdsubst array literal parenDepth decrements before param heredoc",
+				script:      "if false; then x=$(( true ) && a=( ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "downgraded cmdsubst nested subshell parenDepth decrements before param heredoc",
+				script:      "if false; then x=$(( true ) && ( ( echo ${a:-(} ) ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "downgraded cmdsubst nested array literal parenDepth decrements before param heredoc",
+				script:      "if false; then x=$(( true ) && a=( ( echo ${a:-(} ) ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\n",
+				wantDisable: true,
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				trimmed := strings.TrimSuffix(tc.script, "\n")
@@ -23891,6 +24145,19 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{`coproc my"co"`, true, false},
 			{"coproc my-co for", true, true},
 			{`coproc "myco" if`, true, false},
+			{`coproc ${var:=myco}`, true, false},
+			{`coproc "a=b"`, true, false},
+			{`coproc a\=b`, true, false},
+			{`coproc "a"=1`, true, false},
+			{`coproc $((1+1))`, true, false},
+			{"coproc `echo myco`", true, false},
+			{"coproc a[0]", true, false},
+			{"coproc a[ 1 << 2 ]", true, false},
+			{"coproc a[ 1 ]foo", true, false},
+			{`coproc a[0]"="1`, true, false},
+			{"coproc 1a=b", true, false},
+			{"coproc =x", true, false},
+			{"coproc [0]=1", true, false},
 			{"function myfn", true, false},
 			{"function myfn()", true, false},
 			{"function if", true, false},
@@ -23900,6 +24167,15 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{`function "myfn"`, true, false},
 			{`function 'myfn'`, true, false},
 			{`function "my (fn)"()`, true, false},
+			{"function ${name:-myfn}", true, false},
+			{"function ${name:=myfn}", true, false},
+			{"function ${a:-${b:-myfn}}", true, false},
+			{"function ${seed:-{}", true, false},
+			{"function ${x:-`echo }`}", true, false},
+			{"function $((1+1))", true, false},
+			{"function `echo myfn`", true, false},
+			{"function a[0]", true, false},
+			{"function a=1", true, false},
 			{"function if()", true, false},
 			{"function for()", true, false},
 			{"function if for", true, true},
@@ -23914,6 +24190,11 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"myfn() if", true, false},
 			{`"myfn"()`, true, false},
 			{`"if"()`, true, false},
+			{`"a=1"()`, true, false},
+			{"${name:-myfn}()", true, false},
+			{"$((1+1))()", true, false},
+			{"`echo myfn`()", true, false},
+			{"a[ 1 << 2 ]()", true, false},
 			{"my-fn()", true, false},
 			{"for x in", false, false},
 			{"coproc for extra", false, false},
@@ -23922,11 +24203,21 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"coproc fi", false, false},
 			{"coproc !", false, false},
 			{"coproc a=1", false, false},
+			{`coproc a="1"`, false, false},
+			{"coproc a[0]=1", false, false},
+			{"coproc a[ 1 << 2 ]=x", false, false},
+			{"coproc a[0]+=1", false, false},
+			{"coproc a[]=1", false, false},
+			{`coproc a["k"]=1`, false, false},
+			{"coproc foo+a[ 1 ]", false, false},
 			{"coproc >/dev/null", false, false},
 			{`coproc "myco" foo`, false, false},
 			{"function", false, false},
+			{"function a[ 1 ]", false, false},
 			{"function myfn for extra", false, false},
 			{"function myfn(x)", false, false},
+			{"a=1()", false, false},
+			{"a[0]=1()", false, false},
 			{"if()", false, false},
 			{"for()", false, false},
 			{"myfn() coproc", false, false},
@@ -23944,6 +24235,35 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			if gotOK != tc.wantOK || gotFor != tc.wantFor {
 				t.Fatalf("isBashDoubleParenCmdPrefix(%q) = (%v, %v), want (%v, %v)",
 					tc.prefix, gotOK, gotFor, tc.wantOK, tc.wantFor)
+			}
+		}
+
+		// Verify quoted/dollar/backtick/escaped prefix redirections leave
+		// headerStage cleared and do not treat trailing '()' as a function header.
+		for _, redir := range []string{`>"out"`, `>'out'`, `>$out`, `>\out`, ">`echo out`", `> "out"`} {
+			withSpace := redir + ` \`
+			stSpace := &bashScanState{}
+			stSpace.scanLineForCont(withSpace, 0, false, bashContInput{hasTrailingCont: true}, nil)
+			if stSpace.atCmdStart() || stSpace.headerStage() != bashHeaderNone || !stSpace.canAssign() || stSpace.prefixRedirStage() != bashPrefixRedirNone {
+				t.Fatalf("redir+space %q left bad state: cmdStart=%v hs=%v canAssign=%v redirStage=%v",
+					withSpace, stSpace.atCmdStart(), stSpace.headerStage(), stSpace.canAssign(), stSpace.prefixRedirStage())
+			}
+			withOpenParen := redir + "("
+			stOpen := &bashScanState{}
+			stOpen.scanLine(withOpenParen, 0, false)
+			if len(stOpen.frames) != 1 || stOpen.frames[0].kind != bashFrameSubshell || stOpen.frames[0].funcParenPending || stOpen.headerStage() != bashHeaderNone {
+				t.Fatalf("redir+open-paren %q misclassified as function header: frames=%+v hs=%v",
+					withOpenParen, stOpen.frames, stOpen.headerStage())
+			}
+			withParensArith := redir + "() (("
+			stParens := &bashScanState{}
+			stParens.scanLine(withParensArith, 0, false)
+			if stParens.topKind() == bashFrameArith {
+				t.Fatalf("redir+parens+dparen %q misclassified as arithmetic body: frames=%+v",
+					withParensArith, stParens.frames)
+			}
+			if okPrefix, forPrefix := isBashDoubleParenCmdPrefix(redir + "()"); okPrefix || forPrefix {
+				t.Fatalf("isBashDoubleParenCmdPrefix(%q) = (%v, %v), want (false, false)", redir+"()", okPrefix, forPrefix)
 			}
 		}
 
@@ -24136,6 +24456,14 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 		}
 	})
 
+	measureLinear4x("stepDisablesErrexit_unclosed_for_arith_rparen_chain", func(n int) string {
+		return strings.Repeat("for (( ; ) ", n) + "\n"
+	}, func(s string) {
+		if stepDisablesErrexit(s) {
+			panic("unexpected set +e detection in unclosed for arith rparen chain")
+		}
+	})
+
 	t.Run("20000_seeded_checkpoint_vs_non_checkpoint_differential_fuzz", func(t *testing.T) {
 		rng := uint64(0x517cc1b727220a95)
 		next := func(n int) int {
@@ -24152,14 +24480,25 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			"coproc myco ",
 			"coproc my-co ",
 			`coproc "myco" `,
+			"coproc ${var:=myco} ",
+			"coproc `echo myco` ",
+			"coproc a[ 1 << 2 ] ",
 			"coproc time ",
 			"function myfn ",
 			"function if ",
 			`function "myfn" `,
+			"function ${name:=myfn} ",
+			"function `echo myfn` ",
 			"myfn() ",
+			"a[ 1 << 2 ]() ",
 			"myfn() for ",
 			"function myfn if ",
 			"! time -p for ",
+			`>"out" `,
+			`>'out' `,
+			`>$out `,
+			`>\out `,
+			">`echo out` ",
 			"a=1 ",
 			"a+=1 ",
 			"a='1' ",
@@ -24300,6 +24639,24 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			end2, body2, ok2 := scanBashCmdSubstWithCache(tc.src, &cache, tc.pos, true, nil)
 			if !ok1 || !ok2 || cache == nil || end1 != tc.wantEnd || end2 != tc.wantEnd || body1 != tc.wantBody || body2 != tc.wantBody {
 				t.Fatalf("%s mismatch: nil=(%d,%q,%v) cached=(%d,%q,%v) cache=%v", tc.name, end1, body1, ok1, end2, body2, ok2, cache)
+			}
+		}
+
+		{
+			nestedForSrc := "for (( ; for (( ;; ${seed:-)) ; do set +e; done"
+			outerOpen := strings.Index(nestedForSrc, "((")
+			innerOpen := outerOpen + 2 + strings.Index(nestedForSrc[outerOpen+2:], "((")
+			var forCache *bashLineIndex
+			oEnd1, _, _, oOK1 := scanBashDoubleParenWithCache(nestedForSrc, nil, outerOpen, true, true, nil)
+			oEnd2, _, _, oOK2 := scanBashDoubleParenWithCache(nestedForSrc, &forCache, outerOpen, true, true, nil)
+			if oOK1 || oOK2 || oEnd1 != 0 || oEnd2 != 0 || forCache == nil {
+				t.Fatalf("outer unclosed for (( mismatch: nil=(%d,%v) cached=(%d,%v)", oEnd1, oOK1, oEnd2, oOK2)
+			}
+			iEndNil, iBodyNil, iArithNil, iOKNil := scanBashDoubleParenWithCache(nestedForSrc, nil, innerOpen, true, true, nil)
+			iEndCached, iBodyCached, iArithCached, iOKCached := scanBashDoubleParenWithCache(nestedForSrc, &forCache, innerOpen, true, true, nil)
+			if !iOKNil || !iOKCached || !iArithNil || !iArithCached || iEndNil != iEndCached || iBodyNil != iBodyCached {
+				t.Fatalf("inner closed for (( cached-vs-nil parity failed (failedForDP=%v): nil=(%d,%q,%v,%v) cached=(%d,%q,%v,%v)",
+					forCache.failedForDoubleParen, iEndNil, iBodyNil, iArithNil, iOKNil, iEndCached, iBodyCached, iArithCached, iOKCached)
 			}
 		}
 
@@ -24989,6 +25346,260 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 						name:       "prefix_coproc_two_words_syntax_error",
 						script:     "if false; then coproc \"myco\" foo (( 1 )); fi",
 						wantBashOK: false,
+					},
+					{
+						name:          "for_arith_inner_closed_by_param_rparen_keeps_outer_unclosed",
+						script:        "if false; then for (( ; for (( ;; ${seed:-)) ; do :; done; fi\nset +e\n",
+						wantBashOK:    false,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "for_arith_param_double_rparen_valid_bash",
+						script:        "if false; then for (( ;; ${seed:-)) ; do :; done; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FOR_VALID\n",
+						wantOut:       "'\nFOR_VALID\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_redir_dq_allows_arr_shift_assign",
+						script:        "if false; then >\"out\" arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_DQ\n",
+						wantOut:       "R_DQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_redir_sq_allows_arr_shift_assign",
+						script:        "if false; then >'out' arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_SQ\n",
+						wantOut:       "R_SQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_redir_dollar_allows_arr_shift_assign",
+						script:        "if false; then >$out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_VAR\n",
+						wantOut:       "R_VAR\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_redir_esc_allows_arr_shift_assign",
+						script:        "if false; then >\\out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_ESC\n",
+						wantOut:       "R_ESC\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_redir_backtick_allows_arr_shift_assign",
+						script:        "if false; then >`echo out` arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_BT\n",
+						wantOut:       "R_BT\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:       "prefix_redir_dq_parens_syntax_error",
+						script:     "if false; then >\"out\"() (( 1 )); fi",
+						wantBashOK: false,
+					},
+					{
+						name:          "prefix_function_param_default_dparen",
+						script:        "if false; then function ${name:-myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_DEF\n",
+						wantOut:       "'\nFN_P_DEF\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_function_param_assign_dparen",
+						script:        "if false; then function ${name:=myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_EQ\n",
+						wantOut:       "'\nFN_P_EQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_function_nested_param_dparen",
+						script:        "if false; then function ${a:-${b:-myfn}} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_NEST\n",
+						wantOut:       "'\nFN_P_NEST\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_function_arith_name_dparen",
+						script:        "if false; then function $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARITH\n",
+						wantOut:       "'\nFN_ARITH\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_param_parens_dparen",
+						script:        "if false; then ${name:-myfn}() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho P_PARENS\n",
+						wantOut:       "'\nP_PARENS\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_arith_parens_dparen",
+						script:        "if false; then $((1+1))() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho A_PARENS\n",
+						wantOut:       "'\nA_PARENS\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_coproc_param_assign_op_dparen",
+						script:        "if false; then coproc ${var:=myco} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_P_EQ\n",
+						wantOut:       "'\nC_P_EQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_dq_eq_dparen",
+						script:        "if false; then coproc \"a=b\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ_EQ\n",
+						wantOut:       "'\nC_DQ_EQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_esc_eq_dparen",
+						script:        "if false; then coproc a\\=b (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ESC_EQ\n",
+						wantOut:       "'\nC_ESC_EQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_arith_name_dparen",
+						script:        "if false; then coproc $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARITH\n",
+						wantOut:       "'\nC_ARITH\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:       "prefix_coproc_assign_word_syntax_error",
+						script:     "if false; then coproc a=1 (( 1 )); fi",
+						wantBashOK: false,
+					},
+					{
+						name:       "prefix_coproc_arr_assign_word_syntax_error",
+						script:     "if false; then coproc a[0]=1 (( 1 )); fi",
+						wantBashOK: false,
+					},
+					{
+						name:          "prefix_coproc_backtick_space_dparen",
+						script:        "if false; then coproc `echo myco` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_BT\n",
+						wantOut:       "'\nC_BT\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_function_backtick_space_dparen",
+						script:        "if false; then function `echo myfn` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_BT\n",
+						wantOut:       "'\nFN_BT\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_backtick_space_parens_dparen",
+						script:        "if false; then `echo myfn`() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho BT_P\n",
+						wantOut:       "'\nBT_P\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_coproc_subscript_a0_dparen",
+						script:        "if false; then coproc a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUB0\n",
+						wantOut:       "'\nC_SUB0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_subscript_shift_dparen",
+						script:        "if false; then coproc a[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBS\n",
+						wantOut:       "'\nC_SUBS\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_subscript_quoted_eq_dparen",
+						script:        "if false; then coproc a[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBQ\n",
+						wantOut:       "'\nC_SUBQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_function_subscript_a0_dparen",
+						script:        "if false; then function a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_SUB0\n",
+						wantOut:       "'\nFN_SUB0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_subscript_shift_parens_dparen",
+						script:        "if false; then a[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho SUB_P\n",
+						wantOut:       "'\nSUB_P\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "downgraded_comsub_subshell_paren_depth_outside_param",
+						script:        "EOF() { :; }\nif false; then x=$(( true ) && ( echo ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_SUB\n",
+						wantOut:       "P2_SUB\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "downgraded_comsub_array_paren_depth_outside_param",
+						script:        "EOF() { :; }\nif false; then x=$(( true ) && a=( ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_ARR\n",
+						wantOut:       "P2_ARR\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "downgraded_comsub_nested_subshell_paren_depth_outside_param",
+						script:        "EOF() { :; }\nif false; then x=$(( true ) && ( ( echo ${a:-(} ) ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\nEOF\nfalse\necho P2_NSUB\n",
+						wantOut:       "P2_NSUB\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
 					},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
