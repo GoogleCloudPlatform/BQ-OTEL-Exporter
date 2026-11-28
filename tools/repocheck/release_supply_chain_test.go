@@ -1831,6 +1831,14 @@ func (s *bashScanState) pushFrame(kind bashFrameKind) {
 	s.frames = append(s.frames, bashLexFrame{kind: kind})
 }
 
+func (s *bashScanState) pushArraySubscriptFrame(prevHeader bashHeaderStage, prevCmdStart bool) {
+	s.frames = append(s.frames, bashLexFrame{
+		kind:            bashFrameArraySubscript,
+		arrPrevHeader:   prevHeader,
+		arrPrevCmdStart: prevCmdStart,
+	})
+}
+
 func (s *bashScanState) popFrame() {
 	if len(s.frames) == 0 {
 		return
@@ -3730,7 +3738,7 @@ func (s *bashScanState) scanLineForCont(
 				i, atWordStart = s.consumeUnquotedDollar(line, i)
 			case '[':
 				if atWordStart {
-					s.pushFrame(bashFrameArraySubscript)
+					s.pushArraySubscriptFrame(bashHeaderNone, false)
 				}
 				atWordStart = false
 			case '(':
@@ -3975,7 +3983,7 @@ func (s *bashScanState) scanLineForCont(
 				}
 				s.setHeaderStage(bashHeaderNone)
 			}
-			inArithStart := s.atCmdStart() || hs == bashHeaderFor || hs == bashHeaderCoprocNameWord
+			inArithStart := s.atCmdStart() || hs == bashHeaderFor || hs == bashHeaderCoprocNameWord || hs == bashHeaderFuncKeywordWord
 			forArith := hs == bashHeaderFor
 			s.setHeaderStage(bashHeaderNone)
 			hasAdjacentSecondParen := len(s.contSegs) == 0 && i+1 < len(line) && line[i+1] == '('
@@ -4252,11 +4260,7 @@ func (s *bashScanState) scanLineForCont(
 					prevCmdStart := s.atCmdStart()
 					i++
 					s.setHeaderStage(bashHeaderNone)
-					s.frames = append(s.frames, bashLexFrame{
-						kind:            bashFrameArraySubscript,
-						arrPrevHeader:   hs,
-						arrPrevCmdStart: prevCmdStart,
-					})
+					s.pushArraySubscriptFrame(hs, prevCmdStart)
 					atWordStart = false
 					continue
 				}
@@ -23817,6 +23821,86 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantDisable: true,
 			},
 			{
+				name:        "coproc multi-char subscript arr0 dparen exposes set +e",
+				script:      "if false; then coproc arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc multi-char subscript arr bitshift dparen exposes set +e",
+				script:      "if false; then coproc arr[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "coproc multi-char subscript arr quoted eq dparen exposes set +e",
+				script:      "if false; then coproc arr[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "multi-char subscript arr bitshift parens dparen exposes set +e",
+				script:      "if false; then arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "time multi-char subscript arr bitshift parens dparen exposes set +e",
+				script:      "if false; then time arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "function multi-char subscript arr0 dparen exposes set +e",
+				script:      "if false; then function arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function double-quoted name dparen exposes set +e",
+				script:      "if false; then function \"myfn\"(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function single-quoted name dparen exposes set +e",
+				script:      "if false; then function 'myfn'(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function hyphenated name dparen exposes set +e",
+				script:      "if false; then function my-fn(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function single-char subscript a0 dparen exposes set +e",
+				script:      "if false; then function a[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function multi-char subscript arr0 dparen exposes set +e",
+				script:      "if false; then function arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function dollar var name dparen exposes set +e",
+				script:      "if false; then function $name(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function param assign name dparen exposes set +e",
+				script:      "if false; then function ${name:=myfn}(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function backtick name dparen exposes set +e",
+				script:      "if false; then function `echo myfn`(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached function cmdsubst name dparen exposes set +e",
+				script:      "if false; then function $(echo myfn)(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
+				name:        "attached coproc multi-char subscript arr0 dparen exposes set +e",
+				script:      "if false; then coproc arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\n",
+				wantDisable: true,
+			},
+			{
 				name:        "downgraded cmdsubst subshell parenDepth decrements before param heredoc",
 				script:      "if false; then x=$(( true ) && ( echo ${a:-(} ) && echo ${b:-1 ) <<EOF } ); fi\nset +e\n",
 				wantDisable: true,
@@ -24155,6 +24239,9 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"coproc a[ 1 << 2 ]", true, false},
 			{"coproc a[ 1 ]foo", true, false},
 			{`coproc a[0]"="1`, true, false},
+			{"coproc arr[0]", true, false},
+			{"coproc arr[ 1 << 2 ]", true, false},
+			{`coproc arr[0]"="1`, true, false},
 			{"coproc 1a=b", true, false},
 			{"coproc =x", true, false},
 			{"coproc [0]=1", true, false},
@@ -24166,6 +24253,9 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"function fi", true, false},
 			{`function "myfn"`, true, false},
 			{`function 'myfn'`, true, false},
+			{"function my-fn", true, false},
+			{"function $name", true, false},
+			{"function $(echo myfn)", true, false},
 			{`function "my (fn)"()`, true, false},
 			{"function ${name:-myfn}", true, false},
 			{"function ${name:=myfn}", true, false},
@@ -24175,6 +24265,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"function $((1+1))", true, false},
 			{"function `echo myfn`", true, false},
 			{"function a[0]", true, false},
+			{"function arr[0]", true, false},
 			{"function a=1", true, false},
 			{"function if()", true, false},
 			{"function for()", true, false},
@@ -24195,6 +24286,9 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			{"$((1+1))()", true, false},
 			{"`echo myfn`()", true, false},
 			{"a[ 1 << 2 ]()", true, false},
+			{"arr[ 1 << 2 ]()", true, false},
+			{"time arr[ 1 << 2 ]()", true, false},
+			{"time -p arr[ 1 << 2 ]()", true, false},
 			{"my-fn()", true, false},
 			{"for x in", false, false},
 			{"coproc for extra", false, false},
@@ -24483,6 +24577,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			"coproc ${var:=myco} ",
 			"coproc `echo myco` ",
 			"coproc a[ 1 << 2 ] ",
+			"coproc arr[ 1 << 2 ] ",
 			"coproc time ",
 			"function myfn ",
 			"function if ",
@@ -24491,6 +24586,8 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			"function `echo myfn` ",
 			"myfn() ",
 			"a[ 1 << 2 ]() ",
+			"arr[ 1 << 2 ]() ",
+			"time arr[ 1 << 2 ]() ",
 			"myfn() for ",
 			"function myfn if ",
 			"! time -p for ",
@@ -25576,6 +25673,152 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 						wantBashOK:    true,
 						wantDisable:   true,
 						checkDisables: true,
+					},
+					{
+						name:          "prefix_coproc_multi_subscript_arr0_dparen",
+						script:        "if false; then coproc arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARR0\n",
+						wantOut:       "'\nC_ARR0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_multi_subscript_shift_dparen",
+						script:        "if false; then coproc arr[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRS\n",
+						wantOut:       "'\nC_ARRS\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_coproc_multi_subscript_quoted_eq_dparen",
+						script:        "if false; then coproc arr[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRQ\n",
+						wantOut:       "'\nC_ARRQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:          "prefix_multi_subscript_shift_parens_dparen",
+						script:        "if false; then arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ARR_P\n",
+						wantOut:       "'\nARR_P\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_time_multi_subscript_shift_parens_dparen",
+						script:        "if false; then time arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho T_ARR_P\n",
+						wantOut:       "'\nT_ARR_P\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_function_multi_subscript_arr0_dparen",
+						script:        "if false; then function arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARR0\n",
+						wantOut:       "'\nFN_ARR0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_dq_dparen",
+						script:        "if false; then function \"myfn\"(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DQ\n",
+						wantOut:       "'\nAT_FN_DQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_sq_dparen",
+						script:        "if false; then function 'myfn'(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_SQ\n",
+						wantOut:       "'\nAT_FN_SQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_hyphen_dparen",
+						script:        "if false; then function my-fn(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_HY\n",
+						wantOut:       "'\nAT_FN_HY\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_a0_dparen",
+						script:        "if false; then function a[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_A0\n",
+						wantOut:       "'\nAT_FN_A0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_arr0_dparen",
+						script:        "if false; then function arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_ARR0\n",
+						wantOut:       "'\nAT_FN_ARR0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_dollar_dparen",
+						script:        "if false; then function $name(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DLR\n",
+						wantOut:       "'\nAT_FN_DLR\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_param_eq_dparen",
+						script:        "if false; then function ${name:=myfn}(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_PEQ\n",
+						wantOut:       "'\nAT_FN_PEQ\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_backtick_dparen",
+						script:        "if false; then function `echo myfn`(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_BT\n",
+						wantOut:       "'\nAT_FN_BT\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_function_cmdsubst_dparen",
+						script:        "if false; then function $(echo myfn)(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_CS\n",
+						wantOut:       "'\nAT_FN_CS\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+					},
+					{
+						name:          "prefix_attached_coproc_arr0_dparen",
+						script:        "if false; then coproc arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_C_ARR0\n",
+						wantOut:       "'\nAT_C_ARR0\n",
+						wantBashOK:    true,
+						wantDisable:   true,
+						checkDisables: true,
+						minBashMajor:  4,
+						minBashMinor:  0,
+					},
+					{
+						name:       "bare_ident_attached_dparen_syntax_error",
+						script:     "myfn(( 1 ))",
+						wantBashOK: false,
+					},
+					{
+						name:       "bare_dq_attached_dparen_syntax_error",
+						script:     `"myfn"(( 1 ))`,
+						wantBashOK: false,
 					},
 					{
 						name:          "downgraded_comsub_subshell_paren_depth_outside_param",
