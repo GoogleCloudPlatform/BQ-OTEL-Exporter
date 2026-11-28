@@ -24922,26 +24922,130 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			}
 		}
 
+		type bashFeature string
+		const (
+			bashFeatProcSubstHeredoc              bashFeature = "proc_subst_heredoc"
+			bashFeatCoproc                        bashFeature = "coproc"
+			bashFeatBangTimeForArith              bashFeature = "bang_time_for_arith"
+			bashFeatQuotedArithOperand            bashFeature = "quoted_arith_operand"
+			bashFeatDoubleQuotedDollarSingleBrace bashFeature = "dq_dollar_single_brace"
+			bashFeatArithParamBareLBrace          bashFeature = "arith_param_bare_lbrace"
+			bashFeatDparenBareLBraceDowngrade     bashFeature = "dparen_bare_lbrace_downgrade"
+			bashFeatDparenSplitParenDowngrade     bashFeature = "dparen_split_paren_downgrade"
+			bashFeatDparenParamSplitRparen        bashFeature = "dparen_param_split_rparen"
+			bashFeatDparenParamHashSplitRparen    bashFeature = "dparen_param_hash_split_rparen"
+			bashFeatCmdSubstSplitDoubleRparen     bashFeature = "cmdsubst_split_double_rparen"
+			bashFeatCmdSubstSubshellParamParen    bashFeature = "cmdsubst_subshell_param_paren"
+		)
+		type bashProbeSpec struct {
+			syntaxOnly bool
+			script     string
+		}
+		bashFeatureProbes := map[bashFeature]bashProbeSpec{
+			bashFeatProcSubstHeredoc: {
+				script: "test \"$(cat <(cat <<INNER\nhi\nINNER\n))\" = \"hi\"",
+			},
+			bashFeatCoproc: {
+				script: `[ "$(LC_ALL=C type -t coproc)" = keyword ]`,
+			},
+			bashFeatBangTimeForArith: {
+				syntaxOnly: true,
+				script:     `! time -p for (( i=0; i<1; i++ )); do :; done`,
+			},
+			bashFeatQuotedArithOperand: {
+				script: `test "$(( "1" + 2 ))" = 3 && (( "1" ))`,
+			},
+			bashFeatDoubleQuotedDollarSingleBrace: {
+				script: `x=""; test "${x:-$'1}2'}" = "12}"`,
+			},
+			bashFeatArithParamBareLBrace: {
+				script: `seed=1; (( ${seed:-{} + (1 << 0) ))`,
+			},
+			bashFeatDparenBareLBraceDowngrade: {
+				script: "x=true; test \"$( (( ${x:-{1} ) && printf ok\n) )\" = ok",
+			},
+			bashFeatDparenSplitParenDowngrade: {
+				script: "test \"$( (( printf ok )\\\n) 2>/dev/null )\" = ok",
+			},
+			bashFeatDparenParamSplitRparen: {
+				script: "x=echo; test \"$( (( ${x:-)\\\n)} ok\n)) )\" = ok",
+			},
+			bashFeatDparenParamHashSplitRparen: {
+				script: "x=echo; test \"$( (( ${x:-1 # )\\\n)} ok\n)) )\" = ok",
+			},
+			bashFeatCmdSubstSplitDoubleRparen: {
+				script: "test \"$(( 1 + 2\n)\\\n)\" = 3",
+			},
+			bashFeatCmdSubstSubshellParamParen: {
+				script: `test "$( ( true ) && echo ${y:-)} )" = ')' && test "$( ( true ) && echo ${y:-(} )" = '(' && if false; then (( $( ( true ) && echo ${y:-)} ) + (1 << 0) )); (( $( ( true ) && echo ${y:-(} ) + (1 << 0) )); fi`,
+			},
+		}
+
+		runBashProbe := func(syntaxOnly bool, script string) bool {
+			if bashBin == "" {
+				return false
+			}
+			args := []string{"--noprofile", "--norc"}
+			if syntaxOnly {
+				args = append(args, "-n")
+			}
+			args = append(args, "-c", script)
+			return exec.Command(bashBin, args...).Run() == nil
+		}
+		featureProbeCache := make(map[bashFeature]bool, len(bashFeatureProbes))
+		bashSupportsFeature := func(feat bashFeature) bool {
+			if cached, ok := featureProbeCache[feat]; ok {
+				return cached
+			}
+			spec, ok := bashFeatureProbes[feat]
+			if !ok {
+				t.Fatalf("unknown bashFeature %q", feat)
+			}
+			res := runBashProbe(spec.syntaxOnly, spec.script)
+			featureProbeCache[feat] = res
+			return res
+		}
+		syntaxProbeCache := make(map[string]bool)
+		bashSupportsSyntax := func(probeScript string) bool {
+			if cached, ok := syntaxProbeCache[probeScript]; ok {
+				return cached
+			}
+			res := runBashProbe(true, probeScript)
+			syntaxProbeCache[probeScript] = res
+			return res
+		}
+		funcHeaderProbe := func(header string) string {
+			return fmt.Sprintf("if false; then %s (( 1 )); %s ( : ); fi", header, header)
+		}
+		funcAttachedProbe := func(header string) string {
+			return fmt.Sprintf("if false; then %s(( 1 )); %s( : ); fi", header, header)
+		}
+		funcKeywordIfProbe := func(header string) string {
+			return fmt.Sprintf("if false; then %s if (( 1 )); then :; fi; %s if ( : ); then :; fi; fi", header, header)
+		}
+		redirArrShiftProbe := func(redir string) string {
+			return fmt.Sprintf("if false; then %s arr[ 1 << 2 ]=x; fi", redir)
+		}
+
 		type bashParityCase struct {
-			name          string
-			script        string
-			wantOut       string
-			wantBashOK    bool
-			minBashMajor  int
-			minBashMinor  int
-			wantDisable   bool
-			checkDisables bool
+			name            string
+			script          string
+			wantOut         string
+			wantBashOK      bool
+			reqBashFeatures []bashFeature
+			reqBashSyntax   []string
+			wantDisable     bool
+			checkDisables   bool
 		}
 		parityCases := []bashParityCase{
 			{
-				name:          "arith_param_cont_evaluates",
-				script:        "seed=2\nx=$(( ${seed:-0} \\\n  + \"${seed:-0}\" \\\n  + 1 ))\nprintf '%s' \"$x\"",
-				wantOut:       "5",
-				wantBashOK:    true,
-				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
-				minBashMinor:  4,
-				wantDisable:   false,
-				checkDisables: true,
+				name:            "arith_param_cont_evaluates",
+				script:          "seed=2\nx=$(( ${seed:-0} \\\n  + \"${seed:-0}\" \\\n  + 1 ))\nprintf '%s' \"$x\"",
+				wantOut:         "5",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				wantDisable:     false,
+				checkDisables:   true,
 			},
 			{
 				name:          "cmd_arith_param_cont_evaluates",
@@ -24984,34 +25088,31 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "arith_param_bare_lbrace_unquoted",
-				script:        "seed=1\n(( ${seed:-{} + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_U_OK",
-				wantOut:       "BARE_U_OK",
-				wantBashOK:    true,
-				minBashMajor:  4, // Unbalanced unquoted '{' inside ${...} fixed via dolbrace_state in Bash 4.4.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_bare_lbrace_unquoted",
+				script:          "seed=1\n(( ${seed:-{} + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_U_OK",
+				wantOut:         "BARE_U_OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatArithParamBareLBrace},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "arith_param_bare_lbrace_double_quoted",
-				script:        "seed=1\n(( \"${seed:-{}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_DQ_OK",
-				wantOut:       "BARE_DQ_OK",
-				wantBashOK:    true,
-				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_bare_lbrace_double_quoted",
+				script:          "seed=1\n(( \"${seed:-{}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf BARE_DQ_OK",
+				wantOut:         "BARE_DQ_OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "arith_param_bare_lbrace_unmatched_rparen_downgrades",
-				script:        "seed='cat'\n(( ${seed:-{1} ) <<EOF\n'\nEOF\n)\nset +e\nfalse\nprintf BARE_RPAREN_OK",
-				wantOut:       "'\nBARE_RPAREN_OK",
-				wantBashOK:    true,
-				minBashMajor:  4, // Unbalanced unquoted '{' inside ${...} requires Bash 4.4+.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_bare_lbrace_unmatched_rparen_downgrades",
+				script:          "seed='cat'\n(( ${seed:-{1} ) <<EOF\n'\nEOF\n)\nset +e\nfalse\nprintf BARE_RPAREN_OK",
+				wantOut:         "'\nBARE_RPAREN_OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatDparenBareLBraceDowngrade},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
 				name:          "arith_param_hash_rparen_heredoc_bypass_downgrades",
@@ -25070,34 +25171,31 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "arith_param_split_double_rparen_heredoc_bypass_downgrades",
-				script:        "seed='cat'\n(( ${seed:-)\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_D",
-				wantOut:       "'\nATK1_D\n",
-				wantBashOK:    true,
-				minBashMajor:  4, // Split closing parens )\\\n) inside (( )) downgrade/parsing fixed post-Bash 3.2.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_split_double_rparen_heredoc_bypass_downgrades",
+				script:          "seed='cat'\n(( ${seed:-)\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_D",
+				wantOut:         "'\nATK1_D\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatDparenParamSplitRparen},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "arith_param_split_double_rparen_hash_heredoc_bypass_downgrades",
-				script:        "seed='cat'\n(( ${seed:-1 # )\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_F",
-				wantOut:       "'\nATK1_F\n",
-				wantBashOK:    true,
-				minBashMajor:  4, // Split closing parens )\\\n) inside (( )) downgrade/parsing fixed post-Bash 3.2.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_split_double_rparen_hash_heredoc_bypass_downgrades",
+				script:          "seed='cat'\n(( ${seed:-1 # )\\\n)} <<EOF\n'\nEOF\n))\nset +e\nfalse\necho ATK1_F",
+				wantOut:         "'\nATK1_F\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatDparenParamHashSplitRparen},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "cmdsubst_arith_param_unclosed_split_double_rparen_closes",
-				script:        "if false; then x=$(( ${seed:-0\n)\\\n)\nfi\nset +e\nfalse\necho COMSUB_SPLIT_OK",
-				wantOut:       "COMSUB_SPLIT_OK\n",
-				wantBashOK:    true,
-				minBashMajor:  4, // Split closing parens )\\\n) inside $(( )) fixed post-Bash 3.2.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "cmdsubst_arith_param_unclosed_split_double_rparen_closes",
+				script:          "if false; then x=$(( ${seed:-0\n)\\\n)\nfi\nset +e\nfalse\necho COMSUB_SPLIT_OK",
+				wantOut:         "COMSUB_SPLIT_OK\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatCmdSubstSplitDoubleRparen},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
 				name:          "cmdsubst_arith_param_unsplit_double_rparen_closes",
@@ -25108,23 +25206,21 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "dparen_plain_split_closing_parens_downgrades_to_subshell_heredoc",
-				script:        "(( cat <<EOF )\\\n)\n'\nEOF\nset +e\nfalse\necho DPAREN_SPLIT_CAT_OK",
-				wantOut:       "'\nDPAREN_SPLIT_CAT_OK\n",
-				wantBashOK:    true,
-				minBashMajor:  4, // Split closing parens )\\\n) downgrade inside (( )) requires Bash 4.4+.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "dparen_plain_split_closing_parens_downgrades_to_subshell_heredoc",
+				script:          "(( cat <<EOF )\\\n)\n'\nEOF\nset +e\nfalse\necho DPAREN_SPLIT_CAT_OK",
+				wantOut:         "'\nDPAREN_SPLIT_CAT_OK\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatDparenSplitParenDowngrade},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "dparen_plain_split_if_false_heredoc_swallows_set_e",
-				script:        "if false; then\n(( 1 <<EOF )\\\n)\nset +e\nEOF\nfi\nfalse\necho SHOULD_FAIL",
-				wantBashOK:    false,
-				minBashMajor:  4, // Split closing parens )\\\n) downgrade inside (( )) requires Bash 4.4+.
-				minBashMinor:  4,
-				wantDisable:   false,
-				checkDisables: true,
+				name:            "dparen_plain_split_if_false_heredoc_swallows_set_e",
+				script:          "if false; then\n(( 1 <<EOF )\\\n)\nset +e\nEOF\nfi\nfalse\necho SHOULD_FAIL",
+				wantBashOK:      false,
+				reqBashFeatures: []bashFeature{bashFeatDparenSplitParenDowngrade},
+				wantDisable:     false,
+				checkDisables:   true,
 			},
 			{
 				name:          "dparen_plain_unsplit_if_false_bitshift_runs_set_e",
@@ -25142,44 +25238,40 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "cmdsubst_arith_param_double_quoted_rparen_ok",
-				script:        "seed=1\nx=$(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
-				wantOut:       "2_OK",
-				wantBashOK:    true,
-				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "cmdsubst_arith_param_double_quoted_rparen_ok",
+				script:          "seed=1\nx=$(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '%s_OK' \"$x\"",
+				wantOut:         "2_OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "arith_param_double_quoted_rparen_stays_arith",
-				script:        "seed=1\n(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf DQ_RPAREN_OK",
-				wantOut:       "DQ_RPAREN_OK",
-				wantBashOK:    true,
-				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_double_quoted_rparen_stays_arith",
+				script:          "seed=1\n(( \"${seed:-)}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf DQ_RPAREN_OK",
+				wantOut:         "DQ_RPAREN_OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "arith_param_double_quoted_dollar_single_arith_invariant",
-				script:        "seed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '32_OK'",
-				wantOut:       "32_OK",
-				wantBashOK:    true,
-				minBashMajor:  4, // Double-quoted arithmetic operands (Q_ARITH) added in Bash 4.4.
-				minBashMinor:  4,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_double_quoted_dollar_single_arith_invariant",
+				script:          "seed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf '32_OK'",
+				wantOut:         "32_OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatQuotedArithOperand},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "arith_param_double_quoted_dollar_single_closes_first_brace",
-				script:        "x=\"\"\nprintf '<%s>' \"${x:-$'1}2'}\"\nseed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf ' OK'",
-				wantOut:       "<12}> OK",
-				wantBashOK:    true,
-				minBashMajor:  5,
-				minBashMinor:  2,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "arith_param_double_quoted_dollar_single_closes_first_brace",
+				script:          "x=\"\"\nprintf '<%s>' \"${x:-$'1}2'}\"\nseed=1\n(( \"${seed:-$'1'}\" + (1 <<EOF) ))\nset +e\nfalse\nprintf ' OK'",
+				wantOut:         "<12}> OK",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatDoubleQuotedDollarSingleBrace, bashFeatQuotedArithOperand},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
 				name:          "assign_proc_subst_input_allows_spaced_array",
@@ -25222,14 +25314,13 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "assign_proc_subst_heredoc_allows_spaced_array",
-				script:        "v=<(cat <<INNER\nhi\nINNER\nprintf 2) arr[ 1 << 2 ]=x && printf REACHED",
-				wantOut:       "REACHED",
-				wantBashOK:    true,
-				minBashMajor:  4, // Heredocs inside command/process substitutions rewritten via parse_comsub in Bash 4.0.
-				minBashMinor:  0,
-				wantDisable:   false,
-				checkDisables: true,
+				name:            "assign_proc_subst_heredoc_allows_spaced_array",
+				script:          "v=<(cat <<INNER\nhi\nINNER\nprintf 2) arr[ 1 << 2 ]=x && printf REACHED",
+				wantOut:         "REACHED",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatProcSubstHeredoc},
+				wantDisable:     false,
+				checkDisables:   true,
 			},
 			{
 				name:          "assign_proc_subst_glued_echo_allows_spaced_array",
@@ -25274,52 +25365,48 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "prefix_coproc_arith_param_adj_rparen",
-				script:        "if false; then coproc (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_OK\n",
-				wantOut:       "'\nCOPROC_OK\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_arith_param_adj_rparen",
+				script:          "if false; then coproc (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_OK\n",
+				wantOut:         "'\nCOPROC_OK\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
 			},
 			{
-				name:          "prefix_coproc_name_arith_param_adj_rparen",
-				script:        "if false; then coproc myco (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_NAME_OK\n",
-				wantOut:       "'\nCOPROC_NAME_OK\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_name_arith_param_adj_rparen",
+				script:          "if false; then coproc myco (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_NAME_OK\n",
+				wantOut:         "'\nCOPROC_NAME_OK\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
 			},
 			{
-				name:          "prefix_coproc_time_arith_param_adj_rparen",
-				script:        "if false; then coproc time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_TIME_OK\n",
-				wantOut:       "'\nCOPROC_TIME_OK\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_time_arith_param_adj_rparen",
+				script:          "if false; then coproc time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho COPROC_TIME_OK\n",
+				wantOut:         "'\nCOPROC_TIME_OK\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc time`)},
 			},
 			{
-				name:          "prefix_coproc_name_for_arith_param_adj_rparen",
-				script:        "if false; then coproc myco for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho COPROC_FOR_OK\n",
-				wantOut:       "COPROC_FOR_OK\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_name_for_arith_param_adj_rparen",
+				script:          "if false; then coproc myco for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho COPROC_FOR_OK\n",
+				wantOut:         "COPROC_FOR_OK\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
 			},
 			{
 				name:          "prefix_function_name_arith_param_adj_rparen",
 				script:        "if false; then function myfn (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_OK\n",
 				wantOut:       "'\nFN_KW_OK\n",
 				wantBashOK:    true,
-				minBashMajor:  4, // Braceless function <word> (( ... )) without () requires Bash 4.x+.
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function myfn`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25340,12 +25427,13 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "prefix_bang_time_p_for_arith_param_adj_rparen",
-				script:        "if false; then ! time -p for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho BANG_TIME_FOR_OK\n",
-				wantOut:       "BANG_TIME_FOR_OK\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "prefix_bang_time_p_for_arith_param_adj_rparen",
+				script:          "if false; then ! time -p for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho BANG_TIME_FOR_OK\n",
+				wantOut:         "BANG_TIME_FOR_OK\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatBangTimeForArith},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
 				name:          "downgraded_comsub_double_paren_unwinds_param_and_cmdsubst",
@@ -25396,14 +25484,13 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "benign_coproc_closed_downgraded_dparen_keeps_heredoc_inert",
-				script:        "if false; then coproc myco (( ${seed:-)} )); fi\ncat <<EOF\nset +e\nEOF\necho SAFE\n",
-				wantOut:       "set +e\nSAFE\n",
-				wantBashOK:    true,
-				wantDisable:   false,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "benign_coproc_closed_downgraded_dparen_keeps_heredoc_inert",
+				script:          "if false; then coproc myco (( ${seed:-)} )); fi\ncat <<EOF\nset +e\nEOF\necho SAFE\n",
+				wantOut:         "set +e\nSAFE\n",
+				wantBashOK:      true,
+				wantDisable:     false,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
 			},
 			{
 				name:          "for_arith_header_avoids_bogus_bitshift_heredoc",
@@ -25414,24 +25501,22 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				checkDisables: true,
 			},
 			{
-				name:          "single_comsub_subshell_keeps_iswordparen_true_on_rparen",
-				script:        "if false; then (( $( ( true ) && echo ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_OK\n",
-				wantOut:       "SUB_DG_OK\n",
-				wantBashOK:    true,
-				minBashMajor:  4, // parse_comsub added in Bash 4.0 for ) inside ${...} in $(...).
-				minBashMinor:  0,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "single_comsub_subshell_keeps_iswordparen_true_on_rparen",
+				script:          "if false; then (( $( ( true ) && echo ${y:-)} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_OK\n",
+				wantOut:         "SUB_DG_OK\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatCmdSubstSubshellParamParen},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
-				name:          "single_comsub_subshell_keeps_iswordparen_true_on_lparen",
-				script:        "if false; then (( $( ( true ) && echo ${y:-(} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_LPAREN_OK\n",
-				wantOut:       "SUB_DG_LPAREN_OK\n",
-				wantBashOK:    true,
-				minBashMajor:  4, // parse_comsub added in Bash 4.0 for unclosed ( inside ${...} in $(...).
-				minBashMinor:  0,
-				wantDisable:   true,
-				checkDisables: true,
+				name:            "single_comsub_subshell_keeps_iswordparen_true_on_lparen",
+				script:          "if false; then (( $( ( true ) && echo ${y:-(} ) + (1 <<EOF) )); fi\nset +e\nfalse\necho SUB_DG_LPAREN_OK\n",
+				wantOut:         "SUB_DG_LPAREN_OK\n",
+				wantBashOK:      true,
+				reqBashFeatures: []bashFeature{bashFeatCmdSubstSubshellParamParen},
+				wantDisable:     true,
+				checkDisables:   true,
 			},
 			{
 				name:       "dparen_downgraded_comsub_rparen_outside_param_syntax_error",
@@ -25488,8 +25573,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function myfn if (( ${seed:-)) ; then :; fi; fi\nset +e\nfalse\necho FNKW_IF\n",
 				wantOut:       "FNKW_IF\n",
 				wantBashOK:    true,
-				minBashMajor:  4, // Braceless function <word> <compound> with (( requires Bash 4.4+.
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcKeywordIfProbe(`function myfn`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25531,52 +25615,51 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantBashOK: false,
 			},
 			{
-				name:          "prefix_coproc_hyphen_name_dparen",
-				script:        "if false; then coproc my-co (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_HYPH\n",
-				wantOut:       "'\nC_HYPH\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_hyphen_name_dparen",
+				script:          "if false; then coproc my-co (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_HYPH\n",
+				wantOut:         "'\nC_HYPH\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc my-co`)},
 			},
 			{
-				name:          "prefix_coproc_dot_name_dparen",
-				script:        "if false; then coproc foo.bar (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DOT\n",
-				wantOut:       "'\nC_DOT\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_dot_name_dparen",
+				script:          "if false; then coproc foo.bar (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DOT\n",
+				wantOut:         "'\nC_DOT\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc foo.bar`)},
 			},
 			{
-				name:          "prefix_coproc_quoted_name_dparen",
-				script:        "if false; then coproc \"myco\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ\n",
-				wantOut:       "'\nC_DQ\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_quoted_name_dparen",
+				script:          "if false; then coproc \"myco\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ\n",
+				wantOut:         "'\nC_DQ\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc "myco"`)},
 			},
 			{
-				name:          "prefix_coproc_hyphen_name_for_arith",
-				script:        "if false; then coproc my-co for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho C_HYPH_FOR\n",
-				wantOut:       "C_HYPH_FOR\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_hyphen_name_for_arith",
+				script:          "if false; then coproc my-co for (( ;; ${seed:-)) ; do :; done; fi\nset +e\nfalse\necho C_HYPH_FOR\n",
+				wantOut:         "C_HYPH_FOR\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{`if false; then coproc my-co for (( i=0; i<1; i++ )); do :; done; fi`},
 			},
 			{
 				name:          "prefix_function_reserved_if_dparen",
 				script:        "if false; then function if (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_IF\n",
 				wantOut:       "'\nFN_KW_IF\n",
 				wantBashOK:    true,
-				minBashMajor:  4, // Reserved words, quotes, and expansions as function names with (( require Bash 4.4+.
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function if`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25585,8 +25668,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function for (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_FOR\n",
 				wantOut:       "'\nFN_KW_FOR\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function for`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25595,8 +25677,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function time (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_TIME\n",
 				wantOut:       "'\nFN_KW_TIME\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function time`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25605,8 +25686,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function fi (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_KW_FI\n",
 				wantOut:       "'\nFN_KW_FI\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function fi`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25615,8 +25695,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function \"myfn\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_DQ\n",
 				wantOut:       "'\nFN_DQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function "myfn"`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25625,8 +25704,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function if() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_IFP\n",
 				wantOut:       "'\nFN_IFP\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function if()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25635,8 +25713,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then \"myfn\"() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho DQ_P\n",
 				wantOut:       "'\nDQ_P\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`"myfn"()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25678,8 +25755,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then >\"out\" arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_DQ\n",
 				wantOut:       "R_DQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4, // Prefix redirections preserving array assignment state require Bash 4.4+.
-				minBashMinor:  4,
+				reqBashSyntax: []string{redirArrShiftProbe(`>"out"`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25688,8 +25764,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then >'out' arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_SQ\n",
 				wantOut:       "R_SQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{redirArrShiftProbe(`>'out'`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25698,8 +25773,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then >$out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_VAR\n",
 				wantOut:       "R_VAR\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{redirArrShiftProbe(`>$out`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25708,8 +25782,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then >\\out arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_ESC\n",
 				wantOut:       "R_ESC\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{redirArrShiftProbe(`>\out`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25718,8 +25791,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then >`echo out` arr[ 1 << 2 ]=x; fi\nset +e\nfalse\necho R_BT\n",
 				wantOut:       "R_BT\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{redirArrShiftProbe(">`echo out`")},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25733,8 +25805,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function ${name:-myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_DEF\n",
 				wantOut:       "'\nFN_P_DEF\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function ${name:-myfn}`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25743,8 +25814,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function ${name:=myfn} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_EQ\n",
 				wantOut:       "'\nFN_P_EQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function ${name:=myfn}`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25753,8 +25823,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function ${a:-${b:-myfn}} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_P_NEST\n",
 				wantOut:       "'\nFN_P_NEST\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function ${a:-${b:-myfn}}`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25763,8 +25832,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARITH\n",
 				wantOut:       "'\nFN_ARITH\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function $((1+1))`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25773,8 +25841,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then ${name:-myfn}() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho P_PARENS\n",
 				wantOut:       "'\nP_PARENS\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`${name:-myfn}()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25783,50 +25850,49 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then $((1+1))() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho A_PARENS\n",
 				wantOut:       "'\nA_PARENS\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`$((1+1))()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
 			{
-				name:          "prefix_coproc_param_assign_op_dparen",
-				script:        "if false; then coproc ${var:=myco} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_P_EQ\n",
-				wantOut:       "'\nC_P_EQ\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_param_assign_op_dparen",
+				script:          "if false; then coproc ${var:=myco} (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_P_EQ\n",
+				wantOut:         "'\nC_P_EQ\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc ${var:=myco}`)},
 			},
 			{
-				name:          "prefix_coproc_dq_eq_dparen",
-				script:        "if false; then coproc \"a=b\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ_EQ\n",
-				wantOut:       "'\nC_DQ_EQ\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_dq_eq_dparen",
+				script:          "if false; then coproc \"a=b\" (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_DQ_EQ\n",
+				wantOut:         "'\nC_DQ_EQ\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc "a=b"`)},
 			},
 			{
-				name:          "prefix_coproc_esc_eq_dparen",
-				script:        "if false; then coproc a\\=b (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ESC_EQ\n",
-				wantOut:       "'\nC_ESC_EQ\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_esc_eq_dparen",
+				script:          "if false; then coproc a\\=b (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ESC_EQ\n",
+				wantOut:         "'\nC_ESC_EQ\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc a\=b`)},
 			},
 			{
-				name:          "prefix_coproc_arith_name_dparen",
-				script:        "if false; then coproc $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARITH\n",
-				wantOut:       "'\nC_ARITH\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_arith_name_dparen",
+				script:          "if false; then coproc $((1+1)) (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARITH\n",
+				wantOut:         "'\nC_ARITH\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc $((1+1))`)},
 			},
 			{
 				name:       "prefix_coproc_assign_word_syntax_error",
@@ -25839,22 +25905,21 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				wantBashOK: false,
 			},
 			{
-				name:          "prefix_coproc_backtick_space_dparen",
-				script:        "if false; then coproc `echo myco` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_BT\n",
-				wantOut:       "'\nC_BT\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_backtick_space_dparen",
+				script:          "if false; then coproc `echo myco` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_BT\n",
+				wantOut:         "'\nC_BT\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe("coproc `echo myco`")},
 			},
 			{
 				name:          "prefix_function_backtick_space_dparen",
 				script:        "if false; then function `echo myfn` (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_BT\n",
 				wantOut:       "'\nFN_BT\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe("function `echo myfn`")},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25863,48 +25928,46 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then `echo myfn`() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho BT_P\n",
 				wantOut:       "'\nBT_P\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe("`echo myfn`()")},
 				wantDisable:   true,
 				checkDisables: true,
 			},
 			{
-				name:          "prefix_coproc_subscript_a0_dparen",
-				script:        "if false; then coproc a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUB0\n",
-				wantOut:       "'\nC_SUB0\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_subscript_a0_dparen",
+				script:          "if false; then coproc a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUB0\n",
+				wantOut:         "'\nC_SUB0\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc a[0]`)},
 			},
 			{
-				name:          "prefix_coproc_subscript_shift_dparen",
-				script:        "if false; then coproc a[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBS\n",
-				wantOut:       "'\nC_SUBS\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_subscript_shift_dparen",
+				script:          "if false; then coproc a[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBS\n",
+				wantOut:         "'\nC_SUBS\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc a[ 1 << 2 ]`)},
 			},
 			{
-				name:          "prefix_coproc_subscript_quoted_eq_dparen",
-				script:        "if false; then coproc a[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBQ\n",
-				wantOut:       "'\nC_SUBQ\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_subscript_quoted_eq_dparen",
+				script:          "if false; then coproc a[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_SUBQ\n",
+				wantOut:         "'\nC_SUBQ\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc a[0]"="1`)},
 			},
 			{
 				name:          "prefix_function_subscript_a0_dparen",
 				script:        "if false; then function a[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_SUB0\n",
 				wantOut:       "'\nFN_SUB0\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function a[0]`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25913,48 +25976,46 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then a[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho SUB_P\n",
 				wantOut:       "'\nSUB_P\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`a[ 1 << 2 ]()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
 			{
-				name:          "prefix_coproc_multi_subscript_arr0_dparen",
-				script:        "if false; then coproc arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARR0\n",
-				wantOut:       "'\nC_ARR0\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_multi_subscript_arr0_dparen",
+				script:          "if false; then coproc arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARR0\n",
+				wantOut:         "'\nC_ARR0\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc arr[0]`)},
 			},
 			{
-				name:          "prefix_coproc_multi_subscript_shift_dparen",
-				script:        "if false; then coproc arr[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRS\n",
-				wantOut:       "'\nC_ARRS\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_multi_subscript_shift_dparen",
+				script:          "if false; then coproc arr[ 1 << 2 ] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRS\n",
+				wantOut:         "'\nC_ARRS\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc arr[ 1 << 2 ]`)},
 			},
 			{
-				name:          "prefix_coproc_multi_subscript_quoted_eq_dparen",
-				script:        "if false; then coproc arr[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRQ\n",
-				wantOut:       "'\nC_ARRQ\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_coproc_multi_subscript_quoted_eq_dparen",
+				script:          "if false; then coproc arr[0]\"=\"1 (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho C_ARRQ\n",
+				wantOut:         "'\nC_ARRQ\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcHeaderProbe(`coproc arr[0]"="1`)},
 			},
 			{
 				name:          "prefix_multi_subscript_shift_parens_dparen",
 				script:        "if false; then arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho ARR_P\n",
 				wantOut:       "'\nARR_P\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`arr[ 1 << 2 ]()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25963,8 +26024,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then time arr[ 1 << 2 ]() (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho T_ARR_P\n",
 				wantOut:       "'\nT_ARR_P\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`time arr[ 1 << 2 ]()`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25973,8 +26033,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function arr[0] (( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho FN_ARR0\n",
 				wantOut:       "'\nFN_ARR0\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcHeaderProbe(`function arr[0]`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25983,8 +26042,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function \"myfn\"(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DQ\n",
 				wantOut:       "'\nAT_FN_DQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function "myfn"`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -25993,8 +26051,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function 'myfn'(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_SQ\n",
 				wantOut:       "'\nAT_FN_SQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function 'myfn'`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26003,8 +26060,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function my-fn(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_HY\n",
 				wantOut:       "'\nAT_FN_HY\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function my-fn`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26013,8 +26069,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function a[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_A0\n",
 				wantOut:       "'\nAT_FN_A0\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function a[0]`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26023,8 +26078,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_ARR0\n",
 				wantOut:       "'\nAT_FN_ARR0\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function arr[0]`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26033,8 +26087,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function $name(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_DLR\n",
 				wantOut:       "'\nAT_FN_DLR\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function $name`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26043,8 +26096,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function ${name:=myfn}(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_PEQ\n",
 				wantOut:       "'\nAT_FN_PEQ\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function ${name:=myfn}`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26053,8 +26105,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function `echo myfn`(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_BT\n",
 				wantOut:       "'\nAT_FN_BT\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe("function `echo myfn`")},
 				wantDisable:   true,
 				checkDisables: true,
 			},
@@ -26063,20 +26114,19 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				script:        "if false; then function $(echo myfn)(( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_FN_CS\n",
 				wantOut:       "'\nAT_FN_CS\n",
 				wantBashOK:    true,
-				minBashMajor:  4,
-				minBashMinor:  4,
+				reqBashSyntax: []string{funcAttachedProbe(`function $(echo myfn)`)},
 				wantDisable:   true,
 				checkDisables: true,
 			},
 			{
-				name:          "prefix_attached_coproc_arr0_dparen",
-				script:        "if false; then coproc arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_C_ARR0\n",
-				wantOut:       "'\nAT_C_ARR0\n",
-				wantBashOK:    true,
-				wantDisable:   true,
-				checkDisables: true,
-				minBashMajor:  4,
-				minBashMinor:  0,
+				name:            "prefix_attached_coproc_arr0_dparen",
+				script:          "if false; then coproc arr[0](( ${seed:-)) ; fi\ncat <<EOF\n'\nEOF\nset +e\nfalse\necho AT_C_ARR0\n",
+				wantOut:         "'\nAT_C_ARR0\n",
+				wantBashOK:      true,
+				wantDisable:     true,
+				checkDisables:   true,
+				reqBashFeatures: []bashFeature{bashFeatCoproc},
+				reqBashSyntax:   []string{funcAttachedProbe(`coproc arr[0]`)},
 			},
 			{
 				name:       "bare_ident_attached_dparen_syntax_error",
@@ -26114,23 +26164,47 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			},
 		}
 
-		// Verify under a simulated Bash 3.2 host that scanner assertions remain
-		// active for every case while Bash 3.2-safe live cases stay enabled.
+		// Fail-closed sanity check for live bash capability probes + simulated Bash 3.2 coverage.
+		if bashBin != "" {
+			if bashSupportsSyntax("if false; then fi") {
+				t.Fatal("bashSupportsSyntax unexpectedly succeeded on invalid Bash syntax")
+			}
+			if runBashProbe(false, `[ "$(LC_ALL=C type -t no_such_bash_kw_xyz)" = keyword ]`) {
+				t.Fatal("runtime keyword probe unexpectedly succeeded for missing keyword")
+			}
+		}
+
+		sim32Features := map[bashFeature]bool{
+			bashFeatProcSubstHeredoc:              true,
+			bashFeatArithParamBareLBrace:          true,
+			bashFeatCoproc:                        false,
+			bashFeatBangTimeForArith:              false,
+			bashFeatQuotedArithOperand:            false,
+			bashFeatDoubleQuotedDollarSingleBrace: false,
+		}
 		var sim32ScannerCount, sim32LiveCount, sim32GatedCount int
 		for _, tc := range parityCases {
 			if tc.checkDisables || tc.wantBashOK {
 				sim32ScannerCount++
 			}
-			if tc.minBashMajor == 0 || bashVersionAtLeastPair(3, 2, tc.minBashMajor, tc.minBashMinor, true) {
+			enabled := true
+			for _, feat := range tc.reqBashFeatures {
+				if !sim32Features[feat] {
+					enabled = false
+					break
+				}
+			}
+			if enabled {
 				sim32LiveCount++
 			} else {
 				sim32GatedCount++
 			}
 		}
-		if sim32ScannerCount == 0 || sim32LiveCount < 30 || sim32GatedCount == 0 {
-			t.Fatalf("unexpected Bash 3.2 gate distribution: scanner=%d live32=%d gated=%d", sim32ScannerCount, sim32LiveCount, sim32GatedCount)
+		if sim32ScannerCount == 0 || sim32LiveCount < 62 || sim32GatedCount < 28 {
+			t.Fatalf("unexpected simulated Bash 3.2 probe distribution: scanner=%d live32=%d gated=%d", sim32ScannerCount, sim32LiveCount, sim32GatedCount)
 		}
 
+		var liveSkipped int
 		for _, tc := range parityCases {
 			t.Run(tc.name, func(t *testing.T) {
 				if tc.checkDisables {
@@ -26147,9 +26221,19 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 					t.Logf("skipping live bash execution: bash unavailable or unsupported OS (%s)", runtime.GOOS)
 					return
 				}
-				if tc.minBashMajor > 0 && !bashVersionAtLeastPair(bashMajor, bashMinor, tc.minBashMajor, tc.minBashMinor, bashHasVer) {
-					t.Logf("skipping live bash >= %d.%d assertion on %s (%d.%d)", tc.minBashMajor, tc.minBashMinor, bashBin, bashMajor, bashMinor)
-					return
+				for _, feat := range tc.reqBashFeatures {
+					if !bashSupportsFeature(feat) {
+						liveSkipped++
+						t.Logf("skipping live bash assertion on %s (%d.%d): unsupported feature %s", bashBin, bashMajor, bashMinor, feat)
+						return
+					}
+				}
+				for _, syn := range tc.reqBashSyntax {
+					if !bashSupportsSyntax(syn) {
+						liveSkipped++
+						t.Logf("skipping live bash assertion on %s (%d.%d): unsupported syntax probe %q", bashBin, bashMajor, bashMinor, syn)
+						return
+					}
 				}
 				out, runErr := exec.Command(bashBin, "--noprofile", "--norc", "-e", "-c", tc.script).CombinedOutput()
 				if tc.wantBashOK {
@@ -26163,6 +26247,16 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 					t.Fatalf("expected bash non-zero exit, got ok output=%q", out)
 				}
 			})
+		}
+		if bashBin != "" && bashVersionAtLeastPair(bashMajor, bashMinor, 5, 2, bashHasVer) {
+			for feat := range bashFeatureProbes {
+				if !bashSupportsFeature(feat) {
+					t.Fatalf("bash %s (%d.%d) >= 5.2 unexpectedly failed feature probe %s", bashBin, bashMajor, bashMinor, feat)
+				}
+			}
+			if liveSkipped != 0 {
+				t.Fatalf("bash %s (%d.%d) >= 5.2 skipped %d live parity cases, want 0", bashBin, bashMajor, bashMinor, liveSkipped)
+			}
 		}
 	})
 }
