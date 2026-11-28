@@ -6268,8 +6268,8 @@ for good_te in "$@"; do
   [ -z "$out_te_next" ] || exit 40
 done
 `
-		cmd := exec.Command(
-			"bash", "-c", bashCheck, "bash",
+		cmd := newCleanBashCmd(
+			"bash", "--noprofile", "--norc", "-c", bashCheck, "bash",
 			commonAbs, wantDigest, stubBin, failOdBin, failHexOdBin, emptyOdBin, starOdBin, failAwkBin, nulTrailerHdr,
 			missingHdr, corruptHdr, trunc103Hdr,
 			delTrailerHdr, sohTrailerHdr, vtContTrailerHdr, nulTrailerHdr,
@@ -6286,7 +6286,7 @@ done
 			teExampleQ0ChunkedHdr, teQuotedCommaChunkedHdr, teQuotedEscChunkedHdr,
 			teObsFoldQuoteHdr, teEmptyQuotedHdr, teLarge200kCodingHdr, teLarge200kObsFoldHdr,
 		)
-		cmd.Env = append(os.Environ(),
+		cmd.Env = cleanBashEnv(
 			"LC_ALL=en_US.UTF-8",
 			"LANG=en_US.UTF-8",
 			"REAL_AWK_BIN="+realAwk,
@@ -12186,8 +12186,11 @@ cp "$file" "$RELEASE_TEST_DIR/predicates/${mode}-${subject##*@}.json"`,
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"RELEASE_TEST_DIR="+dir, "DIGEST=sha256:"+strings.Repeat("c", 64))
+	cmd.Env = cleanBashEnv(
+		"PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"RELEASE_TEST_DIR="+dir,
+		"DIGEST=sha256:"+strings.Repeat("c", 64),
+	)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("SBOM script failed: %w: %s", err, output)
 	}
@@ -13590,16 +13593,16 @@ func runWorkflowBashScript(t *testing.T, script string, opts exitGateReplayOpts,
 	for k, v := range opts.dockerEnv {
 		envMap[k] = v
 	}
-	env := append([]string(nil), os.Environ()...)
-	for k, v := range envMap {
-		env = append(env, k+"="+v)
+	extraEnv := make([]string, 0, len(envMap))
+	for _, k := range slices.Sorted(maps.Keys(envMap)) {
+		extraEnv = append(extraEnv, k+"="+envMap[k])
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-c", script)
 	cmd.Dir = dir
-	cmd.Env = env
+	cmd.Env = cleanBashEnv(extraEnv...)
 	combined, err := cmd.CombinedOutput()
 	res := exitGateReplayResult{
 		combinedOut: string(combined),
@@ -14167,9 +14170,9 @@ fi
 			if midFlight {
 				midFlag = "1"
 			}
-			cmd := exec.Command("bash", "--noprofile", "--norc", "-c", submitStep.Run)
+			cmd := newCleanBashCmd("bash", "--noprofile", "--norc", "-c", submitStep.Run)
 			cmd.Dir = workDir
-			cmd.Env = append(os.Environ(),
+			cmd.Env = cleanBashEnv(
 				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"GIT_CONFIG_GLOBAL=/dev/null",
 				"GIT_CONFIG_SYSTEM=/dev/null",
@@ -14958,7 +14961,9 @@ func TestReleasePreflightAndResubmitExitGate(t *testing.T) {
 			defer cancel()
 			cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-c", verifyRefStep.Run)
 			cmd.Dir = repoDir
-			cmd.Env = append(os.Environ(),
+			cmd.Env = cleanBashEnv(
+				"GIT_CONFIG_GLOBAL=/dev/null",
+				"GIT_CONFIG_SYSTEM=/dev/null",
 				"RELEASE_TAG="+tag,
 				"GITHUB_REF_FULL="+refFull,
 				"FORCE_RESUBMIT="+forceResubmit,
@@ -17301,9 +17306,9 @@ func TestReleaseResolveManifestDigestStep(t *testing.T) {
 		if dockerFail {
 			notFoundFlag = "1"
 		}
-		cmd := exec.Command("bash", "--noprofile", "--norc", "-c", step.Run)
+		cmd := newCleanBashCmd("bash", "--noprofile", "--norc", "-c", step.Run)
 		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
+		cmd.Env = cleanBashEnv(
 			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"GITHUB_OUTPUT="+outPath,
 			"RELEASE_TAG="+releaseTag,
@@ -17772,16 +17777,16 @@ func replayPromoteLatestFull(t *testing.T, script string, opts promoteLatestRepl
 	for k, v := range opts.dockerEnv {
 		envMap[k] = v
 	}
-	cmdEnv := append([]string(nil), os.Environ()...)
-	for k, v := range envMap {
-		cmdEnv = append(cmdEnv, k+"="+v)
+	extraEnv := make([]string, 0, len(envMap))
+	for _, k := range slices.Sorted(maps.Keys(envMap)) {
+		extraEnv = append(extraEnv, k+"="+envMap[k])
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script)
 	cmd.Dir = repoDir
-	cmd.Env = cmdEnv
+	cmd.Env = cleanBashEnv(extraEnv...)
 	out, err := cmd.CombinedOutput()
 	return promoteLatestReplayResult{
 		out:         string(out),
@@ -21850,15 +21855,34 @@ func TestBoundedAwkWindowsMasksLiteralsAndRegexes(t *testing.T) {
 }
 
 func cleanBashEnv(extra ...string) []string {
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"LC_ALL=C",
-		"LANG=C",
+	entries := []struct{ key, val string }{
+		{"PATH", os.Getenv("PATH")},
+		{"LC_ALL", "C"},
+		{"LANG", "C"},
 	}
 	if tmpdir := os.Getenv("TMPDIR"); tmpdir != "" {
-		env = append(env, "TMPDIR="+tmpdir)
+		entries = append(entries, struct{ key, val string }{"TMPDIR", tmpdir})
 	}
-	return append(env, extra...)
+	indexByKey := make(map[string]int, len(entries)+len(extra))
+	out := make([]string, 0, len(entries)+len(extra))
+	for _, e := range entries {
+		indexByKey[e.key] = len(out)
+		out = append(out, e.key+"="+e.val)
+	}
+	for _, kv := range extra {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			out = append(out, kv)
+			continue
+		}
+		if idx, exists := indexByKey[k]; exists {
+			out[idx] = kv
+			continue
+		}
+		indexByKey[k] = len(out)
+		out = append(out, kv)
+	}
+	return out
 }
 
 func newCleanBashCmd(bashBin string, args ...string) *exec.Cmd {
@@ -25041,7 +25065,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				return false, nil
 			}
 			args = append(args, "-c", script)
-			err := newCleanBashCmd(bin, args...).Run()
+			out, err := newCleanBashCmd(bin, args...).CombinedOutput()
 			if err == nil {
 				return true, nil
 			}
@@ -25050,7 +25074,7 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				return false, fmt.Errorf("launch bash runtime probe %q: %w", bin, err)
 			}
 			if code := exitErr.ExitCode(); code != 1 && code != 2 {
-				return false, fmt.Errorf("unexpected bash runtime probe exit %d: %w", code, err)
+				return false, fmt.Errorf("unexpected bash runtime probe exit %d: %w (%s)", code, err, strings.TrimSpace(string(out)))
 			}
 			return false, nil
 		}
@@ -26279,6 +26303,28 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 				t.Fatalf("runtime missing keyword probe = (%v, %v), want (false, nil)", ok, err)
 			}
 
+			dedupEnv := cleanBashEnv("PATH=/custom/bin", "LC_ALL=en_US.UTF-8", "CUSTOM_FLAG=1")
+			var pathVals, lcVals, customVals []string
+			for _, kv := range dedupEnv {
+				k, v, _ := strings.Cut(kv, "=")
+				switch k {
+				case "PATH":
+					pathVals = append(pathVals, v)
+				case "LC_ALL":
+					lcVals = append(lcVals, v)
+				case "CUSTOM_FLAG":
+					customVals = append(customVals, v)
+				}
+			}
+			if !slices.Equal(pathVals, []string{"/custom/bin"}) || !slices.Equal(lcVals, []string{"en_US.UTF-8"}) || !slices.Equal(customVals, []string{"1"}) {
+				t.Fatalf("cleanBashEnv did not deduplicate/replace keys cleanly: PATH=%v LC_ALL=%v CUSTOM_FLAG=%v env=%v", pathVals, lcVals, customVals, dedupEnv)
+			}
+
+			baselineSubshellOK, baselineSubshellErr := evalFeatureProbe(bashBin, make(map[bashFeature]bool), bashFeatCmdSubstSubshellParamParen)
+			if baselineSubshellErr != nil {
+				t.Fatalf("baseline bashFeatCmdSubstSubshellParamParen probe errored: %v", baselineSubshellErr)
+			}
+
 			poisonFile := filepath.Join(t.TempDir(), "poison.sh")
 			if err := os.WriteFile(poisonFile, []byte("echo POISON_BASH_ENV >&2\nexit 99\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -26293,8 +26339,11 @@ func TestBashCmdSubstAndContinuationLinearScaling(t *testing.T) {
 			if envErr != nil || string(out) != "clean:clean:clean:clean" {
 				t.Fatalf("newCleanBashCmd leaked caller environment: out=%q err=%v", out, envErr)
 			}
-			if ok, err := evalFeatureProbe(bashBin, make(map[bashFeature]bool), bashFeatCmdSubstSubshellParamParen); err != nil || !ok {
-				t.Fatalf("poisoned env flipped bashFeatCmdSubstSubshellParamParen: ok=%v err=%v", ok, err)
+			if ok, err := evalFeatureProbe(bashBin, make(map[bashFeature]bool), bashFeatCmdSubstSubshellParamParen); err != nil || ok != baselineSubshellOK {
+				t.Fatalf("poisoned env changed bashFeatCmdSubstSubshellParamParen: got (%v, %v), want baseline (%v, nil)", ok, err, baselineSubshellOK)
+			}
+			if ok, err := evalFeatureProbe(bashBin, make(map[bashFeature]bool), bashFeatArithParamBareLBrace); err != nil || !ok {
+				t.Fatalf("poisoned env broke Bash-3.2-compatible bashFeatArithParamBareLBrace: ok=%v err=%v", ok, err)
 			}
 		})
 

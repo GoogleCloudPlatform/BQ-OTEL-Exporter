@@ -3130,7 +3130,7 @@ func TestCrossOSMatrixInCIWorkflowRejectsBrokenConfigs(t *testing.T) {
 				{name: "split_heredoc_opener", script: "cat <<EO\\\nF >/dev/null\n# body\nEOF\necho done", want: "done"},
 				{name: "back_to_back_multiline_backticks", script: "x=`echo ok\n` && y=`\necho '\n# quoted\n'\n`\n# real comment\nprintf '%s' \"$x,$y\"", want: "ok,\n# quoted"},
 			} {
-				out, bashErr := exec.Command("/bin/bash", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
+				out, bashErr := newCleanBashCmd("/bin/bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", tc.script).CombinedOutput()
 				if bashErr != nil {
 					t.Fatalf("bash parity %q failed: %v\n%s", tc.name, bashErr, out)
 				}
